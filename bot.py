@@ -23,38 +23,76 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     texto_recebido = update.message.text
     mensagem_espera = await update.message.reply_text("Processando com Inteligência Artificial... 🧠")
 
-    today = datetime.now()
-    data_formatada = today.strftime("%d/%m/%Y")
+    hoje = datetime.now()
+    data_formatada = hoje.strftime("%d/%m/%Y")
 
     SYSTEM_PROMPT = f"""
     Você é um extrator de dados financeiros altamente preciso.
-    Hoje é {data_formatada}. Seu ÚNICO objetivo é ler o texto do usuário e extrair os dados da despesa.
+    Hoje é {data_formatada}. Seu objetivo é extrair TODAS as compras descritas no texto.
 
-    REGRAS RÍGIDAS:
-    1. Retorne APENAS um objeto JSON válido. Nada de texto antes ou depois.
-    2. O JSON deve seguir EXATAMENTE esta estrutura:
-       - "item": Nome do que foi comprado.
-       - "valor_total": (float) Valor total. Use ponto.
-       - "categoria_macro": Escolha entre [Alimentação, Transporte, Moradia, Lazer, Saúde, Educação, Compras, Serviços, Outros].
-       - "categoria_detalhada": Seja específico (ex: Restaurante, Combustível, Roupas, Eletrônicos, Streaming, etc).
-       - "metodo_pagamento": [Dinheiro, Cartão de Crédito, Cartão de Débito, Pix, Desconhecido].
-       - "parcelado": (boolean) true se foi parcelado, false se à vista.
-       - "quantidade_parcelas": (int) Número de parcelas (1 se à vista).
-       - "valor_parcela": (float) Valor de cada parcela.
-       - "meses_parcelas": (lista de strings) Se parcelado, calcule e liste os meses exatos das parcelas no formato "MM/YYYY" começando do mês atual ({data_formatada}). Se não for parcelado, retorne uma lista vazia [].
+    ========================
+    REGRA PRINCIPAL DE SEPARAÇÃO (CRÍTICA)
+    ========================
+    Se o texto descrever produtos com FORMAS DE PAGAMENTO DIFERENTES (ex: um parcelado e outro à vista) ou compras não relacionadas, você DEVE OBRIGATORIAMENTE criar múltiplos objetos independentes dentro da lista "transacoes". NUNCA agrupe itens com condições de pagamento diferentes na mesma transação.
 
-    Exemplo de compra parcelada:
+    ========================
+    ESTRUTURA DO JSON
+    ========================
     {{
-      "item": "Geladeira",
-      "valor_total": 3000.00,
-      "categoria_macro": "Moradia",
-      "categoria_detalhada": "Eletrodomésticos",
-      "metodo_pagamento": "Cartão de Crédito",
-      "parcelado": true,
-      "quantidade_parcelas": 3,
-      "valor_parcela": 1000.00,
-      "meses_parcelas": ["{today.strftime('%m/%Y')}", "{(today.month%12)+1:02d}/{today.year + (today.month//12)}", "{(today.month+1)%12+1:02d}/{today.year + ((today.month+1)//12)}"]
+      "transacoes": [
+        {{
+          "numero_nota": "String com o número da nota fiscal/NFC-e (ou null se não houver)",
+          "data_compra": "DD/MM/YYYY",
+          "itens": [
+            {{
+              "numero_item_nota": int (posição do item na nota, ou null se não houver),
+              "item": "Nome",
+              "marca": "Nome da marca ou null",
+              "valor": float,
+              "quantidade": float,
+              "hierarquia_categorias": {{
+                "macro": "Macro categoria",
+                "categoria": "Categoria principal",
+                "subcategoria": "Subcategoria",
+                "produto": "Tipo do produto",
+                "detalhe": "Variação ou detalhe específico"
+              }}
+            }}
+          ],
+          "valor_total": float,
+          "categoria_macro": "...",
+          "metodo_pagamento": "Dinheiro | Cartão de Crédito | Cartão de Débito | Pix | Financiamento | Desconhecido",
+          "parcelado": boolean,
+          "quantidade_parcelas": int (1 se à vista),
+          "detalhamento_parcelas": [] (lista de objetos contendo "mes" e "valor". Vazia se à vista)
+        }}
+      ]
     }}
+
+    ========================
+    REGRAS DE CATEGORIZAÇÃO (HIERARQUIA)
+    ========================
+    Siga ESTRITAMENTE esta estrutura de 5 níveis para o campo 'hierarquia_categorias'. 
+    Exemplos guiados:
+    - Tomate cereja -> {{"macro": "Alimentação", "categoria": "Hortifruti", "subcategoria": "Verduras", "produto": "Tomate", "detalhe": "Tomate Cereja"}}
+    - Arroz integral -> {{"macro": "Alimentação", "categoria": "Mercado", "subcategoria": "Grãos", "produto": "Arroz", "detalhe": "Integral"}}
+    - Carro Hatch -> {{"macro": "Transporte", "categoria": "Veículos", "subcategoria": "Automóvel", "produto": "Carro", "detalhe": "Hatch"}}
+    - Camiseta Hurley -> {{"macro": "Compras", "categoria": "Vestuário", "subcategoria": "Roupas", "produto": "Camiseta", "detalhe": "Estampada"}}
+
+    ========================
+    REGRAS DE MARCA E DATA
+    ========================
+    1. Extrair marca quando explícita (ex: "ventilador Mondial" -> Mondial). Se não houver, retorne null.
+    2. Se não houver data explícita na mensagem, use {data_formatada}.
+
+    ========================
+    REGRAS DE PARCELAMENTO E VALORES
+    ========================
+    1. Se "à vista": parcelado=false, quantidade_parcelas=1, detalhamento_parcelas=[].
+    2. Se "parcelado": parcelado=true.
+       - detalhamento_parcelas = gerar a lista exata contendo "mes" (MM/YYYY) e o "valor" da parcela daquele mês, considerando a data atual ({data_formatada}) ou a data mencionada no texto (ex: "a partir do próximo mês").
+
+    RETORNE APENAS JSON VÁLIDO. NÃO INCLUA NENHUM TEXTO ANTES OU DEPOIS DAS CHAVES.
     """
 
     try:
@@ -67,7 +105,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             temperature=0.0,
         )
 
-        resposta_ia = chat_completion.choices[0].message.content
+        resposta_ia = chat_completion.choices[0].message.content.strip()
+
+        inicio_json = resposta_ia.find('{')
+        fim_json = resposta_ia.rfind('}') + 1
+
+        if inicio_json != -1 and fim_json != 0:
+            resposta_ia = resposta_ia[inicio_json:fim_json]
+
         dados_json = json.loads(resposta_ia)
         resposta_formatada = json.dumps(dados_json, indent=2, ensure_ascii=False)
 
@@ -94,3 +139,4 @@ if __name__ == '__main__':
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.run_polling()
+
