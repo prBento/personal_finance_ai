@@ -6,6 +6,7 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from groq import Groq
 from dateutil.relativedelta import relativedelta
+from database import salvar_transacoes_no_banco
 
 # 1. Carrega as chaves
 load_dotenv()
@@ -164,8 +165,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(resposta_formatada) > 3900:
                 resposta_formatada = resposta_formatada[:3900] + "\n\n... [JSON TRUNCADO DEVIDO AO LIMITE DE CARACTERES DO TELEGRAM]"
 
+            
+            sucesso_db, mensagem_db = salvar_transacoes_no_banco(dados_json)
+            icone = "💾✅" if sucesso_db else "💾❌"
+
             await mensagem_espera.edit_text(
-                f"✅ **Extração Concluída:**\n```json\n{resposta_formatada}\n```", 
+                f"✅ **Extração Concluída:**\n"
+                f"{icone} **Status do Banco:** {mensagem_db}\n\n"
+                f"```json\n{resposta_formatada}\n```", 
                 parse_mode="Markdown"
             )
 
