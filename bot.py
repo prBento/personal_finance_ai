@@ -7,6 +7,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from groq import Groq
 from dateutil.relativedelta import relativedelta
 from database import salvar_transacoes_no_banco
+import requests
+from bs4 import BeautifulSoup
 
 # 1. Carrega as chaves
 load_dotenv()
@@ -32,14 +34,54 @@ def gerar_detalhamento_parcelas(valor_total, qtd_parcelas, mes_inicio_str):
         })
     return detalhamento
 
+def extrair_texto_nota(url):
+    """Acessa o link da SEFAZ e extrai todo o texto da página."""
+    try:
+        # Finge ser um navegador real (Google Chrome) para a SEFAZ não bloquear nosso bot
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        
+        # Faz o download da página
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        # Se a página carregou com sucesso (Código 200)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            # Extrai apenas o texto visível, ignorando o código HTML
+            texto_limpo = soup.get_text(separator=' | ', strip=True)
+            return texto_limpo
+        else:
+            return None
+    except Exception as e:
+        print(f"Erro ao raspar nota: {e}")
+        return None
+
 # 2. Define a resposta para o comando /start
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Olá! Sou seu Assistente Financeiro Inteligente. 📊🧠\nMe mande um gasto em texto livre (ex: 'Comprei um tênis por 500 em 5x no cartão') e eu estruturo pra você!")
 
 # 3. Define o que ele faz ao receber qualquer texto
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto_recebido = update.message.text
+    texto_original = update.message.text
     mensagem_espera = await update.message.reply_text("Processando com Inteligência Artificial... 🧠")
+
+    # --- NOVA LÓGICA: INTERCEPTADOR DE LINKS ---
+    if texto_original.startswith("http://") or texto_original.startswith("https://"):
+        await mensagem_espera.edit_text("Acessando o portal da SEFAZ para ler a nota fiscal... 🕵️‍♂️")
+        texto_raspado = extrair_texto_nota(texto_original)
+        
+        if texto_raspado:
+            # Substitui a mensagem do usuário pelo texto gigante da nota
+            texto_recebido = f"Extraia os dados desta nota fiscal:\n\n{texto_raspado}"
+            await mensagem_espera.edit_text("Nota lida! Estruturando os dados com Inteligência Artificial... 🧠")
+        else:
+            await mensagem_espera.edit_text("❌ Não consegui acessar o link da nota. O site pode estar fora do ar.")
+            return # Aborta se não conseguiu ler o link
+    else:
+        # Se for texto normal, segue a vida
+        texto_recebido = texto_original
+    # ------------------------------------------
 
     hoje = datetime.now()
     data_formatada = hoje.strftime("%d/%m/%Y")
@@ -77,6 +119,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     - hierarquia_categorias: Gere nomes reais e lógicos para macro, categoria, subcategoria e produto.
     - ATENÇÃO A VALORES GRANDES: "1 mil" = 1000.00, "50 mil" = 50000.00. 
     - mes_inicio_parcelas: Se o mês não for informado no texto, use {hoje.strftime('%m/%Y')}.
+    - numero_nota: Procure pelo "Número" e "Série" da nota fiscal no texto e junte os dois (ex: "309953 - Série 120"). Se não encontrar, deixe null.
+    - codigo_produto: OBRIGATÓRIO extrair o código de TODOS os itens da nota. Leia com atenção item por item (ex: "Código: 15954" -> "15954"). Nunca pule um produto.
 
     ESTRUTURA DO JSON DE SUCESSO:
     {{
@@ -84,7 +128,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
       "mensagem_interacao": "Ok",
       "transacoes": [
         {{
-          "numero_nota": null,
+          "numero_nota": "Número danota fiscal ou null",
+          "serie_nota": "Série da Nota ou null",
           "data_compra": "DD/MM/YYYY",
           "local_compra": {{ "nome": "Nome do local", "tipo": "Físico | Online | App | Desconhecido" }},
           "status": "Ativa",
@@ -92,6 +137,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             {{
               "numero_item_nota": null,
               "item": "Nome do produto",
+              "codigo_produto": "Código ou null",
               "marca": "Marca ou null",
               "valor_unitario": 0.0,
               "quantidade": float,

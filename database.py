@@ -20,6 +20,7 @@ def criar_tabelas():
     CREATE TABLE IF NOT EXISTS transacoes (
         id SERIAL PRIMARY KEY,
         numero_nota VARCHAR(255),
+        serie_nota VARCHAR(50),
         data_compra VARCHAR(20),
         local_nome VARCHAR(255),
         local_tipo VARCHAR(50),
@@ -39,6 +40,7 @@ def criar_tabelas():
         id SERIAL PRIMARY KEY,
         transacao_id INT REFERENCES transacoes(id) ON DELETE CASCADE,
         numero_item_nota INT,
+        codigo_produto VARCHAR(100),
         item VARCHAR(255),
         marca VARCHAR(255),
         valor_unitario DECIMAL(10, 2),
@@ -86,15 +88,16 @@ def salvar_transacoes_no_banco(dados_json):
             # 1. INSERE A TRANSAÇÃO PRINCIPAL (Capa)
             sql_transacao = """
                 INSERT INTO transacoes (
-                    numero_nota, data_compra, local_nome, local_tipo, status, 
+                    numero_nota, serie_nota, data_compra, local_nome, local_tipo, status, 
                     valor_original, desconto_aplicado, valor_total_pago, 
                     categoria_macro, metodo_pagamento, parcelado, 
                     quantidade_parcelas, mes_inicio_parcelas
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
             """
             valores_transacao = (
                 t.get("numero_nota"),
+                t.get("serie_nota"),
                 t.get("data_compra"),
                 t.get("local_compra", {}).get("nome"),
                 t.get("local_compra", {}).get("tipo"),
@@ -116,16 +119,17 @@ def salvar_transacoes_no_banco(dados_json):
             # 2. INSERE OS ITENS (Amarrados ao ID da Transação)
             sql_item = """
                 INSERT INTO itens (
-                    transacao_id, numero_item_nota, item, marca, valor_unitario, 
+                    transacao_id, numero_item_nota, codigo_produto, item, marca, valor_unitario, 
                     quantidade, cat_macro, cat_categoria, cat_subcategoria, 
                     cat_produto, cat_detalhe
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """
             for item in t.get("itens", []):
                 cat = item.get("hierarquia_categorias", {})
                 valores_item = (
                     transacao_id,
                     item.get("numero_item_nota"),
+                    item.get("codigo_produto"),
                     item.get("item"),
                     item.get("marca"),
                     item.get("valor_unitario"),
