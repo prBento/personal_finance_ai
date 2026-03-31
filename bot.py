@@ -1,248 +1,512 @@
 import os
 import json
-from datetime import datetime
-from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from groq import Groq
+import re
+import traceback
+from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
-from database import salvar_transacoes_no_banco
+from dotenv import load_dotenv
+
 import requests
 from bs4 import BeautifulSoup
+from pypdf import PdfReader
 
-# 1. Carrega as chaves
-load_dotenv()
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from groq import AsyncGroq # <-- NOVO: Cliente Assíncrono para não travar o bot!
+
+from database import criar_tabelas, salvar_transacoes_no_banco, buscar_cartao_db, salvar_cartao_db, listar_cartoes_db
+
+# ==========================================
+# 1. CONFIGURAÇÕES E CHAVES
+# ==========================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-# Inicializa o Client da IA
-groq_client = Groq(api_key=GROQ_API_KEY)
+# Agora o cliente é Async!
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-def gerar_detalhamento_parcelas(valor_total, qtd_parcelas, mes_inicio_str):
-    if qtd_parcelas <= 1:
-        return []
-    
+
+# ==========================================
+# 2. PROMPTS DOS AGENTES
+# ==========================================
+PROMPT_AGENTE_1 = """
+Você é um extrator de dados de notas fiscais e textos financeiros. Hoje é [DATA_ATUAL].
+Sua única função é ler o texto bruto e transcrever os dados exatos para um JSON.
+NÃO categorize. NÃO invente dados. 
+Retorne valores numéricos SEMPRE com ponto (.) como separador decimal.
+
+ESTRUTURA DE SAÍDA OBRIGATÓRIA (Apenas JSON):
+{
+  "sucesso": true,
+  "mensagem_interacao": "Ok",
+  "cabecalho": {
+    "local": "Nome da Empresa/Razão Social",
+    "data_compra": "DD/MM/YYYY",
+    "numero_nota": "Número da nota ou null",
+    "serie_nota": "Série ou null",
+    "valor_total_bruto": 0.00,
+    "desconto_total": 0.00,
+    "valor_total_pago": 0.00,
+    "metodo_pagamento": "Dinheiro, Cartão de Crédito, Cartão de Débito, Pix, Boleto ou null",
+    "quantidade_parcelas": 1,
+    "cartao": {
+       "banco": "Nome do Banco (Ex: Itaú, Nubank, Caju) ou null",
+       "variante": "Variante do cartão (Ex: Uniclass, Benefício) ou null"
+    }
+  },
+  "itens": [
+    {
+      "codigo": "Código do produto/serviço ou null",
+      "nome": "Nome exato do item",
+      "quantidade": 1.0,
+      "valor_unitario": 0.00
+    }
+  ]
+}
+"""
+
+PROMPT_AGENTE_2 = f"""
+Você é um Analista Financeiro Sênior. Hoje é [DATA_ATUAL].
+Sua missão é enriquecer e categorizar o JSON recebido.
+
+MAPA DE CATEGORIAS:
+- Alimentação > Hortifruti | Carnes e Peixes | Mercearia | Frios e Laticínios | Bebidas | Padaria | Refeição
+- Limpeza > Cuidados com a Casa
+- Higiene > Cuidados Pessoais
+- Moradia > Contas Residenciais | Aluguel e Impostos
+- Serviços > Assinaturas
+
+REGRAS:
+- valor_original: Copie o "valor_total_bruto".
+- desconto_aplicado: Copie o "desconto_total" (se null, use 0.0).
+- valor_total_pago: Copie o "valor_total_pago".
+- quantidade_parcelas: Se null ou 0, assuma 1.
+- metodo_pagamento: Se null, retorne "Desconhecido".
+- parcelado: true se quantidade_parcelas > 1.
+
+ESTRUTURA DO JSON FINAL:
+{{
+  "sucesso": true,
+  "mensagem_interacao": "Ok",
+  "transacoes": [
+    {{
+      "numero_nota": "Número ou null",
+      "serie_nota": "Série ou null",
+      "data_compra": "DD/MM/YYYY",
+      "local_compra": {{ "nome": "Nome", "tipo": "Físico | Online | App | Boleto/Fatura" }},
+      "status": "Ativa",
+      "cartao": {{ "banco": "Nome ou null", "variante": "Nome ou null" }},
+      "valor_original": float,
+      "desconto_aplicado": float,
+      "valor_total_pago": float,
+      "categoria_macro": "Categoria principal",
+      "metodo_pagamento": "String",
+      "parcelado": boolean,
+      "quantidade_parcelas": int,
+      "itens": [
+        {{
+          "numero_item_nota": null,
+          "item": "Nome do item",
+          "codigo_produto": "Código ou null",
+          "marca": "Marca ou null",
+          "valor_unitario": float,
+          "quantidade": float,
+          "hierarquia_categorias": {{ "macro": "Mapa", "categoria": "Mapa", "subcategoria": "Mapa", "produto": "Nome", "detalhe": "Detalhe ou null" }}
+        }}
+      ]
+    }}
+  ]
+}}
+"""
+
+# ==========================================
+# 3. FUNÇÕES AUXILIARES E DE NEGÓCIO
+# ==========================================
+def extrair_texto_de_url(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        for script_or_style in soup(['script', 'style']):
+            script_or_style.extract()
+        texto = soup.get_text(separator=' ')
+        return '\n'.join([linha.strip() for linha in texto.splitlines() if linha.strip()])
+    except Exception as e:
+        return f"Erro ao acessar link: {str(e)}"
+
+def extrair_json_da_resposta(texto_bruto):
+    """Caçador de JSON blindado."""
+    match = re.search(r'\{.*\}', texto_bruto, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except:
+            pass
+    return None
+
+async def atualizar_status(mensagem, texto):
+    """Tenta editar a mensagem. Se o Telegram bloquear, envia uma nova para não ficar mudo."""
+    try:
+        await mensagem.edit_text(texto)
+    except Exception:
+        try:
+            # Se não der para editar, manda como uma resposta nova na conversa!
+            await mensagem.chat.send_message(texto)
+        except:
+            pass
+
+def calcular_vencimento_fatura(data_compra, dia_fechamento, dia_vencimento):
+    mes_fatura = data_compra.month
+    ano_fatura = data_compra.year
+    if data_compra.day >= dia_fechamento:
+        mes_fatura += 1
+        if mes_fatura > 12:
+            mes_fatura = 1
+            ano_fatura += 1
+
+    mes_vencimento = mes_fatura
+    ano_vencimento = ano_fatura
+    if dia_vencimento < dia_fechamento:
+        mes_vencimento += 1
+        if mes_vencimento > 12:
+            mes_vencimento = 1
+            ano_vencimento += 1
+    return datetime(ano_vencimento, mes_vencimento, dia_vencimento)
+
+def gerar_detalhamento_parcelas(valor_total, qtd_parcelas, data_compra_str, regra_cartao, metodo_pagamento):
     detalhamento = []
-    valor_parcela = round(valor_total / qtd_parcelas, 2)
-    mes_inicio = datetime.strptime(mes_inicio_str, "%m/%Y")
+    qtd_real = max(1, qtd_parcelas)
+    valor_parcela = round(valor_total / qtd_real, 2)
     
-    for i in range(qtd_parcelas):
-        mes_atual = mes_inicio + relativedelta(months=i)
+    try:
+        data_compra = datetime.strptime(data_compra_str, "%d/%m/%Y")
+    except:
+        data_compra = datetime.now()
+        
+    fechamento = int(regra_cartao.get("fechamento", 0)) if regra_cartao else 0
+    vencimento = int(regra_cartao.get("vencimento", 0)) if regra_cartao else 0
+    
+    if regra_cartao and fechamento == 0 and vencimento == 0:
+        data_base = data_compra
+    elif "crédito" in str(metodo_pagamento).lower() or "credito" in str(metodo_pagamento).lower():
+        if regra_cartao:
+            data_base = calcular_vencimento_fatura(data_compra, fechamento, vencimento)
+        else:
+            data_base = data_compra + relativedelta(months=1)
+    else:
+        data_base = data_compra
+
+    for i in range(qtd_real):
+        data_parcela = data_base + relativedelta(months=i)
         detalhamento.append({
-            "mes": mes_atual.strftime("%m/%Y"),
+            "mes": data_parcela.strftime("%m/%Y"),
+            "data_vencimento": data_parcela.strftime("%d/%m/%Y"),
             "valor": valor_parcela
         })
     return detalhamento
 
-def extrair_texto_nota(url):
-    """Acessa o link da SEFAZ e extrai todo o texto da página."""
-    try:
-        # Finge ser um navegador real (Google Chrome) para a SEFAZ não bloquear nosso bot
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
+async def gerar_resumo_e_pedir_confirmacao(update: Update, context: ContextTypes.DEFAULT_TYPE, msg_edit=None):
+    dados_json = context.user_data["transacao_pendente_json"]
+    t = dados_json["transacoes"][0]
+    
+    local = t.get("local_compra", {}).get("nome", "Local Desconhecido")
+    valor = t.get("valor_total_pago", 0.0)
+    metodo = t.get("metodo_pagamento", "Não identificado")
+    parcelas = t.get("quantidade_parcelas", 1)
+    categoria_principal = t.get("categoria_macro", "Não classificada") # Puxa a Macro
+    
+    # Cabeçalho atualizado com a Categoria
+    resumo = f"🛒 **Resumo da Transação**\n"
+    resumo += f"📍 **Local:** {local}\n"
+    resumo += f"🏷️ **Categoria:** {categoria_principal}\n"
+    resumo += f"💰 **Valor:** R$ {valor:.2f}\n"
+    resumo += f"💳 **Método:** {metodo}"
+    
+    banco = t.get("cartao", {}).get("banco")
+    variante = t.get("cartao", {}).get("variante")
+    if banco: resumo += f" ({banco} {variante})\n"
+    else: resumo += "\n"
         
-        # Faz o download da página
-        response = requests.get(url, headers=headers, timeout=10)
+    resumo += f"📅 **Parcelas:** {parcelas}x\n\n"
+    
+    # Itens atualizados com a Subcategoria
+    itens = t.get("itens", [])
+    if itens:
+        resumo += "🛍️ **Itens:**\n"
+        for item in itens[:5]:
+            qtd = item.get("quantidade", 1)
+            nome = item.get("item", "Produto")
+            valor_u = item.get("valor_unitario", 0.0)
+            
+            # Tenta pegar a subcategoria ou categoria para dar contexto ao item
+            hierarquia = item.get("hierarquia_categorias") or {}
+            cat_item = hierarquia.get("subcategoria") or hierarquia.get("categoria") or ""
+            tag_cat = f" _({cat_item})_" if cat_item else ""
+            
+            resumo += f"🔸 {qtd}x {nome} (R$ {valor_u:.2f}){tag_cat}\n"
+            
+        if len(itens) > 5: resumo += f"   *(...e mais {len(itens) - 5} itens)*\n"
+        resumo += "\n"
         
-        # Se a página carregou com sucesso (Código 200)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Extrai apenas o texto visível, ignorando o código HTML
-            texto_limpo = soup.get_text(separator=' | ', strip=True)
-            return texto_limpo
-        else:
-            return None
-    except Exception as e:
-        print(f"Erro ao raspar nota: {e}")
-        return None
-
-# 2. Define a resposta para o comando /start
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Olá! Sou seu Assistente Financeiro Inteligente. 📊🧠\nMe mande um gasto em texto livre (ex: 'Comprei um tênis por 500 em 5x no cartão') e eu estruturo pra você!")
-
-# 3. Define o que ele faz ao receber qualquer texto
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    texto_original = update.message.text
-    mensagem_espera = await update.message.reply_text("Processando com Inteligência Artificial... 🧠")
-
-    # --- NOVA LÓGICA: INTERCEPTADOR DE LINKS ---
-    if texto_original.startswith("http://") or texto_original.startswith("https://"):
-        await mensagem_espera.edit_text("Acessando o portal da SEFAZ para ler a nota fiscal... 🕵️‍♂️")
-        texto_raspado = extrair_texto_nota(texto_original)
+    resumo += "**Vencimentos:**\n"
+    for p in t.get("detalhamento_parcelas", [])[:3]:
+        resumo += f"🔹 {p['data_vencimento']} - R$ {p['valor']:.2f}\n"
+    if parcelas > 3: resumo += f"...e mais {parcelas - 3} parcelas.\n"
         
-        if texto_raspado:
-            # Substitui a mensagem do usuário pelo texto gigante da nota
-            texto_recebido = f"Extraia os dados desta nota fiscal:\n\n{texto_raspado}"
-            await mensagem_espera.edit_text("Nota lida! Estruturando os dados com Inteligência Artificial... 🧠")
-        else:
-            await mensagem_espera.edit_text("❌ Não consegui acessar o link da nota. O site pode estar fora do ar.")
-            return # Aborta se não conseguiu ler o link
+    resumo += "\n⚠️ **Deseja salvar no banco de dados?**"
+
+    teclado = ReplyKeyboardMarkup([["Sim", "Não"]], resize_keyboard=True, one_time_keyboard=True)
+    if msg_edit:
+        try: await msg_edit.delete()
+        except: pass
+        
+    if update.message:
+        await update.message.reply_text(resumo, parse_mode="Markdown", reply_markup=teclado)
     else:
-        # Se for texto normal, segue a vida
+        await context.bot.send_message(chat_id=update.effective_chat.id, text=resumo, parse_mode="Markdown", reply_markup=teclado)
+
+# ==========================================
+# 4. HANDLERS DO TELEGRAM
+# ==========================================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Olá! Sou seu Assistente Financeiro Sênior. Envie seus gastos ou notas fiscais!")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mensagem_espera = await update.message.reply_text("Recebi o arquivo! Lendo o PDF... 📄", reply_markup=ReplyKeyboardRemove())
+    file = await update.message.document.get_file()
+    caminho_pdf = "temp_fatura.pdf"
+    await file.download_to_drive(caminho_pdf)
+    
+    try:
+        reader = PdfReader(caminho_pdf)
+        if reader.is_encrypted:
+            try: reader.decrypt("")
+            except: pass
+        texto_pdf = "".join([page.extract_text() + "\n" for page in reader.pages])
+        os.remove(caminho_pdf)
+        texto_recebido = f"Extraia os dados desta fatura/nota fiscal em PDF:\n\n{texto_pdf}"
+        await handle_message(update, context, texto_pdf=texto_recebido, mensagem_pdf=mensagem_espera)
+    except Exception as e:
+        await mensagem_espera.edit_text(f"❌ Erro ao ler o PDF: {str(e)}")
+        if os.path.exists(caminho_pdf): os.remove(caminho_pdf)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE, texto_pdf=None, mensagem_pdf=None):
+    estado_atual = context.user_data.get("estado")
+
+    fuso_br = timezone(timedelta(hours=-3))
+    data_hoje = datetime.now(fuso_br).strftime("%d/%m/%Y")
+    
+    # === BLOQUEADOR DE MENSAGENS CURTAS ("Sim" acidental) ===
+    texto_recebido_limpo = update.message.text.strip() if update.message.text else ""
+    if not estado_atual and not texto_pdf and len(texto_recebido_limpo) < 4:
+        if not texto_recebido_limpo.startswith("http"):
+            await update.message.reply_text("🤔 Por favor, envie a frase completa do seu gasto ou um arquivo/link de nota fiscal.")
+            return
+
+    # === ESCUDO DA MÁQUINA DE ESTADOS ===
+    try:
+        if estado_atual == "AGUARDANDO_METODO_PAGAMENTO":
+            escolha = update.message.text
+            t = context.user_data["transacao_pendente_json"]["transacoes"][0]
+            t["metodo_pagamento"] = escolha
+            if "Cartão" in escolha:
+                botoes = [[f"{c['banco']} {c['variante']}".strip()] for c in listar_cartoes_db()]
+                botoes.append(["➕ Adicionar Novo Cartão"])
+                await update.message.reply_text("Qual cartão você usou?", reply_markup=ReplyKeyboardMarkup(botoes, resize_keyboard=True, one_time_keyboard=True))
+                context.user_data["estado"] = "AGUARDANDO_SELECAO_CARTAO"
+            else:
+                t["cartao"] = {"banco": None, "variante": None}
+                t["detalhamento_parcelas"] = gerar_detalhamento_parcelas(t.get("valor_total_pago", 0.0), t.get("quantidade_parcelas", 1), t.get("data_compra", data_hoje), None, escolha)
+                context.user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
+                await gerar_resumo_e_pedir_confirmacao(update, context)
+            return
+
+        if estado_atual == "AGUARDANDO_SELECAO_CARTAO":
+            escolha = update.message.text
+            if escolha == "➕ Adicionar Novo Cartão":
+                context.user_data["estado"] = "AGUARDANDO_NOME_NOVO_CARTAO"
+                await update.message.reply_text("Digite o nome do banco e variante\n*(Ex: Nubank Ultravioleta, Caju Benefício)*:", reply_markup=ReplyKeyboardRemove())
+            else:
+                partes = escolha.split(" ", 1)
+                banco = partes[0]
+                variante = partes[1] if len(partes) > 1 else ""
+                t = context.user_data["transacao_pendente_json"]["transacoes"][0]
+                t["cartao"] = {"banco": banco, "variante": variante}
+                
+                cartao_db = buscar_cartao_db(banco, variante)
+                if not cartao_db:
+                    context.user_data["estado"] = "AGUARDANDO_DATAS_CARTAO"
+                    context.user_data["pendente_banco"] = banco
+                    context.user_data["pendente_variante"] = variante
+                    await update.message.reply_text(f"Qual o fechamento e vencimento do {banco} {variante}? (Ex: 1 e 8. Se for benefício, responda 0 e 0)", reply_markup=ReplyKeyboardRemove())
+                    return
+                t["detalhamento_parcelas"] = gerar_detalhamento_parcelas(t.get("valor_total_pago", 0.0), t.get("quantidade_parcelas", 1), t.get("data_compra", data_hoje), cartao_db, t.get("metodo_pagamento", ""))
+                context.user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
+                await gerar_resumo_e_pedir_confirmacao(update, context)
+            return
+
+        if estado_atual == "AGUARDANDO_NOME_NOVO_CARTAO":
+            escolha = update.message.text
+            partes = escolha.split(" ", 1)
+            banco = partes[0]
+            variante = partes[1] if len(partes) > 1 else ""
+            context.user_data.update({"pendente_banco": banco, "pendente_variante": variante})
+            context.user_data["transacao_pendente_json"]["transacoes"][0]["cartao"] = {"banco": banco, "variante": variante}
+            context.user_data["estado"] = "AGUARDANDO_DATAS_CARTAO"
+            await update.message.reply_text(f"Qual o **fechamento e vencimento** do {banco} {variante}?\n*(Ex: '1 e 8'. Se for benefício, responda '0 e 0')*")
+            return
+
+        if estado_atual == "AGUARDANDO_DATAS_CARTAO":
+            numeros = re.findall(r'\d+', update.message.text)
+            if len(numeros) >= 2:
+                fechamento, vencimento = int(numeros[0]), int(numeros[1])
+                banco = context.user_data["pendente_banco"]
+                variante = context.user_data["pendente_variante"]
+                salvar_cartao_db(banco, variante, fechamento, vencimento)
+                await update.message.reply_text(f"✅ Legal! Gravei o cartão {banco} {variante} (Fecha: {fechamento}, Vence: {vencimento}).")
+                
+                t = context.user_data["transacao_pendente_json"]["transacoes"][0]
+                t["detalhamento_parcelas"] = gerar_detalhamento_parcelas(t.get("valor_total_pago", 0.0), t.get("quantidade_parcelas", 1), t.get("data_compra", data_hoje), {"fechamento": fechamento, "vencimento": vencimento}, t.get("metodo_pagamento", ""))
+                context.user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
+                await gerar_resumo_e_pedir_confirmacao(update, context)
+            else:
+                await update.message.reply_text("Não entendi as datas. Responda com dois números (ex: 5 e 12).")
+            return
+
+        if estado_atual == "AGUARDANDO_CONFIRMACAO":
+            resposta = update.message.text.lower()
+            if resposta in ["sim", "s"]:
+                sucesso, msg_banco = salvar_transacoes_no_banco(context.user_data["transacao_pendente_json"])
+                if sucesso:
+                    await update.message.reply_text("✅ Salvo no banco com sucesso!", reply_markup=ReplyKeyboardRemove())
+                else:
+                    await update.message.reply_text(f"❌ Erro ao salvar no banco: {msg_banco}", reply_markup=ReplyKeyboardRemove())
+            else:
+                await update.message.reply_text("🚫 Operação cancelada. Não salvei nada.", reply_markup=ReplyKeyboardRemove())
+            context.user_data.clear()
+            return
+
+    except Exception as e:
+        print(f"Erro na Máquina de Estados: {traceback.format_exc()}")
+        await update.message.reply_text("❌ Ocorreu um erro no painel. O fluxo foi reiniciado.", reply_markup=ReplyKeyboardRemove())
+        context.user_data.clear()
+        return
+
+    # ====================================
+    # --- FLUXO DA INTELIGÊNCIA ARTIFICIAL ---
+    # ====================================
+    if texto_pdf:
+        context.user_data["is_pdf"] = True
+        texto_original = texto_pdf
+        mensagem_espera = mensagem_pdf
         texto_recebido = texto_original
-    # ------------------------------------------
-
-    hoje = datetime.now()
-    data_formatada = hoje.strftime("%d/%m/%Y")
-
-    SYSTEM_PROMPT = f"""
-    Você é um assistente financeiro inteligente. Hoje é {data_formatada}.
-    
-    ========================
-    PASSO 1: VALIDAÇÃO CRÍTICA (OBRIGATÓRIO)
-    ========================
-    Analise rigorosamente a mensagem do usuário. Ela DEVE conter os 2 dados abaixo:
-    1. VALOR: Expresso em números ou palavras (ex: "350 reais", "R$ 50", "50 mil", "10k").
-    2. LOCAL: O nome do estabelecimento, aplicativo, marca ou site (ex: "no Mercado Livre", "na Amazon", "no mercado", "loja Chevrolet", "Ifood", "Shopee").
-
-    SE (E SOMENTE SE) FALTAR O VALOR OU O LOCAL, VOCÊ DEVE ABORTAR A EXTRAÇÃO!
-    Retorne APENAS este JSON pequeno e pare imediatamente:
-    {{
-      "sucesso": false,
-      "mensagem_interacao": "⚠️ Opa, faltou um detalhe! Por favor, reenvie a frase dizendo [o que faltou: o valor ou o local da compra]."
-    }}
-
-    ========================
-    PASSO 2: EXTRAÇÃO (SÓ EXECUTE SE PASSOU NO PASSO 1)
-    ========================
-    Se o texto TEM LOCAL e TEM VALOR, retorne "sucesso": true e preencha a estrutura completa abaixo.
-    
-    REGRAS FINANCEIRAS E MATEMÁTICAS:
-    - FORMATAÇÃO DE NÚMEROS (CRÍTICO): Use SEMPRE ponto (.) como separador decimal. NUNCA use vírgula (,). Exemplo: 50000.00.
-    - metodo_pagamento: Preencha apenas se o usuário falar EXPLICITAMENTE (Pix, Boleto, Cartão, Dinheiro). Se não falar, retorne "Desconhecido". NUNCA deduza ou adivinhe o método.
-    - quantidade_parcelas: Se não for parcelado ou a quantidade não for informada, assuma SEMPRE 1 por padrão. NUNCA use 0.
-    - valor_total_pago: O valor final real da transação.
-    - desconto_aplicado: 0.0 (a não ser que a palavra "desconto" ou "abatimento" seja citada).
-    - valor_original: Exatamente a soma de (valor_total_pago + desconto_aplicado).
-    - valor_unitario: Deixe sempre como 0.0. O sistema calculará isso depois.
-    - hierarquia_categorias: Gere nomes reais e lógicos para macro, categoria, subcategoria e produto.
-    - ATENÇÃO A VALORES GRANDES: "1 mil" = 1000.00, "50 mil" = 50000.00. 
-    - mes_inicio_parcelas: Se o mês não for informado no texto, use {hoje.strftime('%m/%Y')}.
-    - numero_nota: Procure pelo "Número" e "Série" da nota fiscal no texto e junte os dois (ex: "309953 - Série 120"). Se não encontrar, deixe null.
-    - codigo_produto: OBRIGATÓRIO extrair o código de TODOS os itens da nota. Leia com atenção item por item (ex: "Código: 15954" -> "15954"). Nunca pule um produto.
-
-    ESTRUTURA DO JSON DE SUCESSO:
-    {{
-      "sucesso": true,
-      "mensagem_interacao": "Ok",
-      "transacoes": [
-        {{
-          "numero_nota": "Número danota fiscal ou null",
-          "serie_nota": "Série da Nota ou null",
-          "data_compra": "DD/MM/YYYY",
-          "local_compra": {{ "nome": "Nome do local", "tipo": "Físico | Online | App | Desconhecido" }},
-          "status": "Ativa",
-          "itens": [
-            {{
-              "numero_item_nota": null,
-              "item": "Nome do produto",
-              "codigo_produto": "Código ou null",
-              "marca": "Marca ou null",
-              "valor_unitario": 0.0,
-              "quantidade": float,
-              "hierarquia_categorias": {{ "macro": "Nome", "categoria": "Nome", "subcategoria": "Nome", "produto": "Nome", "detalhe": "Detalhe ou null" }}
-            }}
-          ],
-          "valor_original": float,
-          "desconto_aplicado": float,
-          "valor_total_pago": float,
-          "categoria_macro": "Nome",
-          "metodo_pagamento": "Dinheiro | Cartão de Crédito | Cartão de Débito | Pix | Financiamento | Desconhecido",
-          "parcelado": boolean,
-          "quantidade_parcelas": int,
-          "mes_inicio_parcelas": "MM/YYYY"
-        }}
-      ]
-    }}
-
-    REGRA FINAL (CRÍTICA): 
-    RETORNE APENAS 1 (UM) ÚNICO BLOCO JSON. NUNCA REPITA O JSON, NUNCA ESCREVA TEXTOS COMO "Resposta final:". APENAS ABRA A CHAVE {{ E FECHE A CHAVE }}.
-    """
+    else:
+        texto_original = update.message.text
+        if texto_original.startswith("http"):
+            mensagem_espera = await update.message.reply_text("Acessando o link da nota fiscal... 🌐", reply_markup=ReplyKeyboardRemove())
+            texto_recebido = extrair_texto_de_url(texto_original)
+        else:
+            mensagem_espera = await update.message.reply_text("Agente 1 Extraindo dados... 🕵️‍♂️", reply_markup=ReplyKeyboardRemove())
+            texto_recebido = texto_original
 
     try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": texto_recebido}
-            ],
-            model="llama-3.1-8b-instant",
-            temperature=0.0,
-            max_tokens=4000,
+        if texto_pdf or texto_original.startswith("http"):
+            await atualizar_status(mensagem_espera, "Agente 1 Extraindo dados... 🕵️‍♂️")
+
+        prompt_1_dinamico = PROMPT_AGENTE_1.replace("[DATA_ATUAL]", data_hoje)
+        prompt_2_dinamico = PROMPT_AGENTE_2.replace("[DATA_ATUAL]", data_hoje)   
+            
+        # AGORA É AWAIT! Assíncrono e muito mais rápido
+        chat_extrator = await groq_client.chat.completions.create(
+            messages=[{"role": "system", "content": prompt_1_dinamico}, {"role": "user", "content": texto_recebido}],
+            model="llama-3.3-70b-versatile", temperature=0.0, max_tokens=8000
         )
-
-        resposta_ia = chat_completion.choices[0].message.content.strip()
-
-        inicio_json = resposta_ia.find('{')
-        fim_json = resposta_ia.rfind('}') + 1
-
-        if inicio_json != -1 and fim_json != 0:
-            resposta_ia = resposta_ia[inicio_json:fim_json]
-
-        dados_json = json.loads(resposta_ia)
-
-        if not dados_json.get("sucesso", True):
-            await mensagem_espera.edit_text(f"⚠️ **Opa, faltou um detalhe:**\n\n{dados_json.get('mensagem_interacao')}")
         
-        else:
-            for transacao in dados_json.get("transacoes", []):
+        json_agente_1 = extrair_json_da_resposta(chat_extrator.choices[0].message.content)
+        print(f"🤖 Agente 1 extraiu: {json.dumps(json_agente_1, ensure_ascii=False, indent=2)}") 
+        
+        if not json_agente_1:
+            await atualizar_status(mensagem_espera, "❌ A IA não conseguiu extrair os dados. Tente reescrever o gasto.")
+            return
+            
+        valor_verificacao = json_agente_1.get("cabecalho", {}).get("valor_total_pago")
+        local_verificacao = json_agente_1.get("cabecalho", {}).get("local")
+        
+        # Verifica se o local é nulo ou se o valor é nulo/zero
+        if not local_verificacao or not valor_verificacao or float(valor_verificacao) == 0.0:
+            await atualizar_status(mensagem_espera, "⚠️ Não consegui identificar o **valor** ou o **local** da compra nessa mensagem. Pode dar mais detalhes?")
+            return
 
-                valor_original_transacao = transacao.get("valor_original", 0.0)
-                itens = transacao.get("itens", [])
-                
-                # Se for só 1 item, o valor unitário dele é o valor total dividido pela quantidade dele
-                if len(itens) == 1:
-                    qtd_item = itens[0].get("quantidade", 1.0)
-                    if qtd_item > 0:
-                        itens[0]["valor_unitario"] = round(valor_original_transacao / qtd_item, 2)
+        await atualizar_status(mensagem_espera, "Agente 2 Analisando Finanças... 💼")
+        
+        chat_enriquecedor = await groq_client.chat.completions.create(
+            messages=[{"role": "system", "content": prompt_2_dinamico}, {"role": "user", "content": json.dumps(json_agente_1, ensure_ascii=False)}],
+            model="llama-3.3-70b-versatile", temperature=0.1, max_tokens=8000
+        )
+        
+        dados_json = extrair_json_da_resposta(chat_enriquecedor.choices[0].message.content)
+        if not dados_json:
+            await atualizar_status(mensagem_espera, "❌ A IA de análise falhou ao formatar o JSON. Tente novamente.")
+            return
 
-                if transacao.get("parcelado"):
-                    valor = transacao.get("valor_total_pago", 0.0)
-                    qtd = transacao.get("quantidade_parcelas", 1)
+        for transacao in dados_json.get("transacoes", []):
+            itens = transacao.get("itens", [])
+            if len(itens) == 1 and itens[0].get("valor_unitario", 0.0) == 0.0:
+                itens[0]["valor_unitario"] = round(float(transacao.get("valor_original") or 0.0) / max(1, float(itens[0].get("quantidade") or 1)), 2)
 
-                    mes_inicio = transacao.get("mes_inicio_parcelas", hoje.strftime('%m/%Y'))
+            cartao = transacao.get("cartao") or {}
+            banco = cartao.get("banco")
+            variante = cartao.get("variante")
+            
+            metodo_bruto = transacao.get("metodo_pagamento")
+            metodo = str(metodo_bruto).lower() if metodo_bruto and str(metodo_bruto).strip().lower() != "null" else "desconhecido"
+            transacao["metodo_pagamento"] = metodo_bruto if metodo_bruto else "Desconhecido"
 
-                    transacao["detalhamento_parcelas"] = gerar_detalhamento_parcelas(valor, qtd, mes_inicio)
+            is_pdf = context.user_data.get("is_pdf", False)
+            
+            if is_pdf or metodo in ["boleto", "desconhecido", ""]:
+                context.user_data.update({"estado": "AGUARDANDO_METODO_PAGAMENTO", "transacao_pendente_json": dados_json})
+                await atualizar_status(mensagem_espera, "📄 Compra/Fatura identificada!")
+                teclado = ReplyKeyboardMarkup([["Cartão de Crédito", "Cartão de Débito"], ["Pix", "Dinheiro"]], resize_keyboard=True, one_time_keyboard=True)
+                await update.message.reply_text("Como você realizou (ou vai realizar) o pagamento?", reply_markup=teclado) if update.message else await context.bot.send_message(chat_id=update.effective_chat.id, text="Como vai pagar?", reply_markup=teclado)
+                return 
+
+            cartao_db = None
+            if "cartão" in metodo or "cartao" in metodo or "crédito" in metodo or "débito" in metodo:
+                if not banco:
+                    botoes = [[f"{c['banco']} {c['variante']}".strip()] for c in listar_cartoes_db()]
+                    botoes.append(["➕ Adicionar Novo Cartão"])
+                    context.user_data.update({"estado": "AGUARDANDO_SELECAO_CARTAO", "transacao_pendente_json": dados_json})
+                    await atualizar_status(mensagem_espera, "💳 Cartão não identificado!")
+                    teclado = ReplyKeyboardMarkup(botoes, resize_keyboard=True, one_time_keyboard=True)
+                    await update.message.reply_text("Identifiquei uma compra no Cartão, mas não sei qual. Escolha abaixo:", reply_markup=teclado) if update.message else await context.bot.send_message(chat_id=update.effective_chat.id, text="Qual cartão?", reply_markup=teclado)
+                    return 
                 else:
-                    transacao["detalhamento_parcelas"] = []
-            
-            resposta_formatada = json.dumps(dados_json, indent=2, ensure_ascii=False)
+                    cartao_db = buscar_cartao_db(banco, variante)
+                    if not cartao_db:
+                        context.user_data.update({"estado": "AGUARDANDO_DATAS_CARTAO", "transacao_pendente_json": dados_json, "pendente_banco": banco, "pendente_variante": variante})
+                        await atualizar_status(mensagem_espera, f"💳 Cartão Novo: **{banco} {variante}**!")
+                        texto_pergunta = f"Qual o **dia de fechamento** e o **dia de vencimento**? (Ex: 1 e 8. Se for benefício/pré-pago, mande 0 e 0)"
+                        await update.message.reply_text(texto_pergunta) if update.message else await context.bot.send_message(chat_id=update.effective_chat.id, text=texto_pergunta)
+                        return 
 
-            if len(resposta_formatada) > 3900:
-                resposta_formatada = resposta_formatada[:3900] + "\n\n... [JSON TRUNCADO DEVIDO AO LIMITE DE CARACTERES DO TELEGRAM]"
+            transacao["detalhamento_parcelas"] = gerar_detalhamento_parcelas(float(transacao.get("valor_total_pago") or 0.0), int(transacao.get("quantidade_parcelas") or 1), transacao.get("data_compra", data_hoje), cartao_db, metodo)
 
-            
-            sucesso_db, mensagem_db = salvar_transacoes_no_banco(dados_json)
-            icone = "💾✅" if sucesso_db else "💾❌"
+        context.user_data.update({"transacao_pendente_json": dados_json, "estado": "AGUARDANDO_CONFIRMACAO"})
+        await gerar_resumo_e_pedir_confirmacao(update, context, mensagem_espera)
 
-            await mensagem_espera.edit_text(
-                f"✅ **Extração Concluída:**\n"
-                f"{icone} **Status do Banco:** {mensagem_db}\n\n"
-                f"```json\n{resposta_formatada}\n```", 
-                parse_mode="Markdown"
-            )
-
-    except json.JSONDecodeError:
-        erro_msg = f"❌ Erro de Parsing: A IA não retornou um JSON válido.\n\nResposta bruta: {resposta_ia}"
-        # Trava também no erro!
-        if len(erro_msg) > 3900:
-            erro_msg = erro_msg[:3900] + "\n\n... [TEXTO TRUNCADO]"
-
-        await mensagem_espera.edit_text(erro_msg)
     except Exception as e:
-        await mensagem_espera.edit_text(f"❌ Erro no processamento: {str(e)}")
+        print(traceback.format_exc())
+        await atualizar_status(mensagem_espera, f"❌ Erro na comunicação com a IA: {str(e)}")
 
-
-# 4. Inicia o servidor do bot (Long Polling)
+# ==========================================
+# 5. INICIALIZAÇÃO
+# ==========================================
 if __name__ == '__main__':
-    print("Iniciando o bot com IA Avançada... Pressione Ctrl+C para parar.")
-
-    # Constrói a aplicaçã com seu token
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
-    # Configura as "rotas" (handlers) do bot
+    criar_tabelas()
+    print("Iniciando o bot do Telegram...")
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.run_polling()
-
