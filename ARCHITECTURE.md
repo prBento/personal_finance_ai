@@ -1,29 +1,20 @@
-# Architecture Document: AI Data App (Roadmap 2)
+# Architecture Document: AI Data App
 
 ## [PT-BR] Visão Geral
-Este sistema é uma aplicação Full-Stack focada em dados (Data App) para controle financeiro pessoal, utilizando Processamento de Linguagem Natural (NLP) para extração de dados não estruturados (textos e links de notas fiscais).
+Este sistema é uma aplicação Full-Stack focada em dados (Data App) para controle financeiro pessoal. Ele utiliza modelos de Linguagem de Larga Escala (LLMs) para transformar mensagens caóticas do dia a dia (textos, links e PDFs) em uma base de dados relacional governada.
 
 ### Componentes Principais
-1. **Interface de Entrada (Telegram Bot):** Ponto de contato do usuário. Recebe áudios, textos livres ou URLs de notas fiscais (NFC-e).
-2. **Backend (FastAPI):** O cérebro da operação. Gerencia os webhooks do Telegram, orquestra as chamadas de IA e processa as regras de negócio.
-3. **Motor de IA (Groq API):** Utiliza LLMs open-source (ex: Llama 3) para extrair entidades das mensagens e devolver um payload JSON estruturado (Item, Valor, Categoria, Data).
-4. **Banco de Dados (PostgreSQL via Docker):** Armazenamento relacional e transacional dos gastos.
-5. **Interface de Visualização (Streamlit):** Dashboard interativo em Python para visualização de métricas, evolução de gastos e edição manual de registros.
+1. **Interface de Entrada (Telegram Bot):** Ponto de contato assíncrono do usuário. Contém uma máquina de estados para coletar métodos de pagamento e cartões.
+2. **Backend Engine (Python):** O cérebro da operação. Processa o polling do Telegram, executa scrapings (BeautifulSoup) e extração de documentos (PyPDF).
+3. **Queue System (Transactional Outbox):** Fila de processamento embutida no PostgreSQL para garantir resiliência contra indisponibilidades e *Rate Limits* da API de IA.
+4. **Motor de IA (Groq API):** Utiliza LLMs leves e rápidos (como `llama-4-scout-17b`) divididos em dois agentes: Agente de Extração e Agente de Classificação/Enriquecimento.
+5. **Banco de Dados (PostgreSQL via Docker):** Armazenamento relacional que garante a integridade dos dados, possuindo validações heurísticas contra inserções duplicadas.
+6. **Interface de Visualização (Streamlit - Em breve):** Dashboard interativo para visualização de métricas de fluxo de caixa e faturas a pagar.
 
-### Fluxo de Dados
-User -> Telegram -> FastAPI -> Groq (LLM Parsing) -> FastAPI -> PostgreSQL -> Streamlit -> User
-
----
-
-## [EN-US] Overview
-This system is a Full-Stack Data App for personal finance management, leveraging Natural Language Processing (NLP) to extract unstructured data (free text and invoice links).
-
-### Core Components
-1. **Input Interface (Telegram Bot):** The user's touchpoint. It receives audio, free text, or invoice URLs (NFC-e).
-2. **Backend (FastAPI):** The brain of the operation. It manages Telegram webhooks, orchestrates AI calls, and processes business rules.
-3. **AI Engine (Groq API):** Uses open-source LLMs (e.g., Llama 3) to extract entities from messages and return a structured JSON payload (Item, Value, Category, Date).
-4. **Database (PostgreSQL via Docker):** Relational and transactional storage for expenses.
-5. **Visualization Interface (Streamlit):** Interactive Python dashboard for viewing metrics, expense trends, and manual record editing.
-
-### Data Flow
-User -> Telegram -> FastAPI -> Groq (LLM Parsing) -> FastAPI -> PostgreSQL -> Streamlit -> User
+### Fluxo de Dados Resiliente
+1. `User` envia Mensagem -> `Bot` salva na Tabela de Fila (`PENDENTE`) -> Retorna "Recebido".
+2. `Worker` (Rodando em background a cada 10s) lê a fila -> Envia para `Groq API`.
+3. Em caso de *Rate Limit*, `Worker` reagenda para X segundos (Exponential Backoff).
+4. `Groq` devolve JSON -> `Worker` formata regras (Maiúsculas, UUIDs, anti-parcelamento).
+5. `Worker` invoca a UI do Telegram pedindo Confirmação Humana (Human-in-the-loop).
+6. Após "Sim", salva nas tabelas normalizadas do `PostgreSQL` -> Disponível para `Streamlit`.
