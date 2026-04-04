@@ -21,6 +21,7 @@
 - [ ] **Task 11 (FastAPI):** Transition from Long Polling to Webhooks.
 - [ ] **Task 12 (Cloud):** Deploy to Cloud PaaS (Render/Railway) with proper Secret Management.
 - [ ] **Task 13 (Anticipation):** Commands for early installment payments with discount yields.
+- [ ] **Task 14 (UX/UI AP/AR):** Enhance the `/contas` command to display credit card information (Bank/Variant) next to pending installments, allowing the user to visually group purchases belonging to the same credit card invoice.
 
 ---
 
@@ -38,3 +39,4 @@
 - [ ] **Task 11 (FastAPI):** Transição de Long Polling para Webhooks.
 - [ ] **Task 12 (Nuvem):** Deploy para Cloud PaaS (Render/Railway) com gestão de segredos.
 - [ ] **Task 13 (Antecipação):** Comandos para pagamento antecipado de parcelas com cálculo de desconto.
+- [ ] **Task 14 (UX/UI Contas a Pagar):** Melhorar o comando `/contas` para exibir a informação do cartão de crédito (Banco/Variante) ao lado da parcela pendente, permitindo agrupar visualmente as compras que pertencem à mesma fatura.
