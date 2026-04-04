@@ -2,212 +2,251 @@ import os
 import psycopg2
 from dotenv import load_dotenv
 
-# Carrega as variáveis de ambiente
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-def conectar():
+def get_db_connection():
+    """Establishes and returns a connection to the PostgreSQL database."""
     try:
         return psycopg2.connect(DATABASE_URL)
     except Exception as e:
-        print(f"Erro ao conectar ao banco: {e}")
+        print(f"Error connecting to database: {e}")
         return None
 
-def criar_tabelas():
-    conn = conectar()
+def create_tables():
+    """Creates all necessary relational tables if they do not exist."""
+    conn = get_db_connection()
     if not conn: return
     try:
         cursor = conn.cursor()
         
-        # --- TABELA DE FILA (NOVO) ---
+        # Outbox Queue Table for processing messages asynchronously
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS fila_processamento (
+            CREATE TABLE IF NOT EXISTS process_queue (
                 id SERIAL PRIMARY KEY,
                 chat_id BIGINT,
-                texto_recebido TEXT,
+                received_text TEXT,
                 is_pdf BOOLEAN,
-                status VARCHAR(20) DEFAULT 'PENDENTE',
-                tentativas INT DEFAULT 0,
-                proxima_tentativa TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                resultado_json TEXT
+                status VARCHAR(20) DEFAULT 'PENDING',
+                attempts INT DEFAULT 0,
+                next_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                json_result TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
 
+        # Main Transactions Table
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS transacoes (
+            CREATE TABLE IF NOT EXISTS transactions (
                 id SERIAL PRIMARY KEY,
-                numero_nota VARCHAR(50),
-                serie_nota VARCHAR(50),
-                data_compra VARCHAR(20),
-                cartao_banco VARCHAR(100),
-                cartao_variante VARCHAR(100),
-                local_nome VARCHAR(255),
-                local_tipo VARCHAR(50),
+                transaction_type VARCHAR(20) DEFAULT 'DESPESA',
+                invoice_number VARCHAR(50),
+                invoice_serial VARCHAR(50),
+                transaction_date VARCHAR(20),
+                card_bank VARCHAR(100),
+                card_variant VARCHAR(100),
+                location_name VARCHAR(255),
+                location_type VARCHAR(50),
                 status VARCHAR(50),
-                valor_original DECIMAL(10, 2),
-                desconto_aplicado DECIMAL(10, 2),
-                valor_total_pago DECIMAL(10, 2),
-                categoria_macro VARCHAR(100),
-                metodo_pagamento VARCHAR(50),
-                parcelado BOOLEAN,
-                quantidade_parcelas INT
+                original_amount DECIMAL(10, 2),
+                discount_applied DECIMAL(10, 2),
+                total_amount DECIMAL(10, 2),
+                macro_category VARCHAR(100),
+                payment_method VARCHAR(50),
+                is_installment BOOLEAN,
+                installment_count INT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         
-        # --- ITENS SEM CAT_DETALHE ---
+        # Transaction Items (1-to-N relationship with transactions)
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS itens (
+            CREATE TABLE IF NOT EXISTS transaction_items (
                 id SERIAL PRIMARY KEY,
-                transacao_id INT REFERENCES transacoes(id) ON DELETE CASCADE,
-                numero_item_nota VARCHAR(50),
-                codigo_produto VARCHAR(100),
-                item VARCHAR(255),
-                marca VARCHAR(100),
-                valor_unitario DECIMAL(10, 2),
-                quantidade DECIMAL(10, 3),
+                transaction_id INT REFERENCES transactions(id) ON DELETE CASCADE,
+                item_type VARCHAR(20),
+                item_number VARCHAR(50),
+                product_code VARCHAR(100),
+                description VARCHAR(255),
+                brand VARCHAR(100),
+                unit_price DECIMAL(10, 2),
+                quantity DECIMAL(10, 3),
                 cat_macro VARCHAR(100),
-                cat_categoria VARCHAR(100),
-                cat_subcategoria VARCHAR(100),
-                cat_produto VARCHAR(100)
+                cat_category VARCHAR(100),
+                cat_subcategory VARCHAR(100),
+                cat_product VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         
+        # AP/AR Ledger (Accounts Payable/Receivable)
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS parcelas (
+            CREATE TABLE IF NOT EXISTS installments (
                 id SERIAL PRIMARY KEY,
-                transacao_id INT REFERENCES transacoes(id) ON DELETE CASCADE,
-                mes VARCHAR(20),
-                data_vencimento VARCHAR(20),
-                valor DECIMAL(10, 2)
+                transaction_id INT REFERENCES transactions(id) ON DELETE CASCADE,
+                month VARCHAR(20),
+                due_date VARCHAR(20),
+                amount DECIMAL(10, 2),
+                payment_status VARCHAR(20) DEFAULT 'PENDING',
+                payment_date VARCHAR(20),
+                paid_amount DECIMAL(10, 2) DEFAULT 0.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         
+        # User's Credit Cards configuration
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS cartoes (
+            CREATE TABLE IF NOT EXISTS credit_cards (
                 id SERIAL PRIMARY KEY,
-                banco VARCHAR(100),
-                variante VARCHAR(100),
-                dia_fechamento INT,
-                dia_vencimento INT
+                bank VARCHAR(100),
+                variant VARCHAR(100),
+                closing_day INT,
+                due_day INT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
         conn.commit()
     except Exception as e:
-        print(f"Erro ao criar tabelas: {e}")
+        print(f"Error creating tables: {e}")
     finally:
         if 'cursor' in locals(): cursor.close()
         if conn: conn.close()
 
-# ==========================================
-# FUNÇÕES DA FILA DE PROCESSAMENTO
-# ==========================================
-def adicionar_na_fila(chat_id, texto, is_pdf):
-    conn = conectar()
+def add_to_queue(chat_id, text, is_pdf):
+    """Inserts a new message/document into the Outbox Queue for background processing."""
+    conn = get_db_connection()
     if not conn: return False
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO fila_processamento (chat_id, texto_recebido, is_pdf, status)
-            VALUES (%s, %s, %s, 'PENDENTE')
-        """, (chat_id, texto, is_pdf))
+            INSERT INTO process_queue (chat_id, received_text, is_pdf, status)
+            VALUES (%s, %s, %s, 'PENDING')
+        """, (chat_id, text, is_pdf))
         conn.commit()
         return True
     finally:
         if conn: conn.close()
 
-def buscar_proximo_fila():
-    conn = conectar()
+def get_next_in_queue():
+    """Fetches the next pending item from the queue, locking it for processing."""
+    conn = get_db_connection()
     if not conn: return None
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id, chat_id, texto_recebido, is_pdf, tentativas 
-            FROM fila_processamento 
-            WHERE status = 'PENDENTE' AND proxima_tentativa <= CURRENT_TIMESTAMP
-            ORDER BY proxima_tentativa ASC LIMIT 1
+            SELECT id, chat_id, received_text, is_pdf, attempts 
+            FROM process_queue 
+            WHERE status = 'PENDING' AND next_attempt <= CURRENT_TIMESTAMP
+            ORDER BY next_attempt ASC LIMIT 1
             FOR UPDATE SKIP LOCKED;
         """)
-        resultado = cursor.fetchone()
-        if resultado:
-            cursor.execute("UPDATE fila_processamento SET status = 'PROCESSANDO' WHERE id = %s", (resultado[0],))
+        result = cursor.fetchone()
+        if result:
+            cursor.execute("UPDATE process_queue SET status = 'PROCESSING' WHERE id = %s", (result[0],))
             conn.commit()
-            return {"id": resultado[0], "chat_id": resultado[1], "texto": resultado[2], "is_pdf": resultado[3], "tentativas": resultado[4]}
+            return {"id": result[0], "chat_id": result[1], "text": result[2], "is_pdf": result[3], "attempts": result[4]}
         return None
     finally:
         if conn: conn.close()
 
-def reagendar_fila(id_fila, segundos_espera, tentativas):
-    conn = conectar()
+def reschedule_queue_item(item_id, wait_seconds, attempts):
+    """Reschedules a failed queue item using Exponential Backoff."""
+    conn = get_db_connection()
     if not conn: return
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            UPDATE fila_processamento 
-            SET status = 'PENDENTE', tentativas = %s, proxima_tentativa = CURRENT_TIMESTAMP + INTERVAL '%s seconds'
+            UPDATE process_queue 
+            SET status = 'PENDING', attempts = %s, next_attempt = CURRENT_TIMESTAMP + INTERVAL '%s seconds'
             WHERE id = %s
-        """, (tentativas + 1, segundos_espera, id_fila))
+        """, (attempts + 1, wait_seconds, item_id))
         conn.commit()
     finally:
         if conn: conn.close()
 
-def concluir_fila(id_fila):
-    conn = conectar()
+def complete_queue_item(item_id):
+    """Marks a queue item as fully processed."""
+    conn = get_db_connection()
     if not conn: return
     try:
         cursor = conn.cursor()
-        cursor.execute("UPDATE fila_processamento SET status = 'CONCLUIDO' WHERE id = %s", (id_fila,))
+        cursor.execute("UPDATE process_queue SET status = 'COMPLETED' WHERE id = %s", (item_id,))
         conn.commit()
     finally:
         if conn: conn.close()
 
-# ==========================================
-# FUNÇÕES DO DOMÍNIO
-# ==========================================
-def salvar_transacoes_no_banco(dados_json):
-    conn = conectar()
-    if not conn: return False, "Falha na conexão com o DB."
+def cancel_queue_items(chat_id):
+    """Cancels all pending queue items for a specific user (Cancel Command)."""
+    conn = get_db_connection()
+    if not conn: return False
     try:
         cursor = conn.cursor()
-        for t in dados_json.get("transacoes", []):
-            cartao = t.get("cartao") or {}
-            local = t.get("local_compra") or {}
+        cursor.execute("""
+            UPDATE process_queue 
+            SET status = 'CANCELLED' 
+            WHERE chat_id = %s AND status IN ('PENDING', 'PROCESSING')
+        """, (chat_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        return False
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if conn: conn.close()
 
+def save_transactions_to_db(json_data):
+    """Parses the LLM JSON output (PT) and saves it into the Database tables (EN)."""
+    conn = get_db_connection()
+    if not conn: return False, "DB Connection Failed."
+    try:
+        cursor = conn.cursor()
+        for t in json_data.get("transacoes", []):
+            card = t.get("cartao") or {}
+            location = t.get("local_compra") or {}
+
+            t_type = str(t.get("tipo_transacao") or "DESPESA").upper()
             v_orig = float(t.get("valor_original") or 0.0)
             v_desc = float(t.get("desconto_aplicado") or 0.0)
-            v_pago = float(t.get("valor_total_pago") or 0.0)
-            parcelado = bool(t.get("parcelado"))
-            qtd_parc = int(t.get("quantidade_parcelas") or 1)
+            v_paid = float(t.get("valor_total") or 0.0)
+            is_installment = bool(t.get("parcelado"))
+            install_qty = int(t.get("quantidade_parcelas") or 1)
 
-            sql_transacao = """
-                INSERT INTO transacoes (
-                    numero_nota, serie_nota, data_compra, cartao_banco, cartao_variante,
-                    local_nome, local_tipo, status, valor_original, desconto_aplicado,
-                    valor_total_pago, categoria_macro, metodo_pagamento, parcelado,
-                    quantidade_parcelas
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            # Insert Main Transaction
+            sql_transaction = """
+                INSERT INTO transactions (
+                    transaction_type, invoice_number, invoice_serial, transaction_date, card_bank, card_variant,
+                    location_name, location_type, status, original_amount, discount_applied,
+                    total_amount, macro_category, payment_method, is_installment,
+                    installment_count
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
             """
-            valores_transacao = (
-                t.get("numero_nota"), t.get("serie_nota"), t.get("data_compra"),
-                cartao.get("banco"), cartao.get("variante"),
-                str(local.get("nome") or "DESCONHECIDO").upper(), local.get("tipo"), t.get("status", "Ativa"),
-                v_orig, v_desc, v_pago, str(t.get("categoria_macro") or "").upper(),
-                t.get("metodo_pagamento"), parcelado, qtd_parc
+            tx_values = (
+                t_type, t.get("numero_nota"), t.get("serie_nota"), t.get("dt_transacao"),
+                card.get("banco"), card.get("variante"),
+                str(location.get("nome") or "DESCONHECIDO").upper(), location.get("tipo"), t.get("status", "Ativa"),
+                v_orig, v_desc, v_paid, str(t.get("categoria_macro") or "").upper(),
+                t.get("metodo_pagamento"), is_installment, install_qty
             )
-            cursor.execute(sql_transacao, valores_transacao)
-            transacao_id = cursor.fetchone()[0]
+            cursor.execute(sql_transaction, tx_values)
+            transaction_id = cursor.fetchone()[0]
 
-            # ITENS (AGORA 100% MAIÚSCULO E SEM CAT_DETALHE)
+            # Insert Items
             sql_item = """
-                INSERT INTO itens (
-                    transacao_id, numero_item_nota, codigo_produto, item, marca, valor_unitario,
-                    quantidade, cat_macro, cat_categoria, cat_subcategoria, cat_produto
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
+                INSERT INTO transaction_items (
+                    transaction_id, item_type, item_number, product_code, description, brand, unit_price,
+                    quantity, cat_macro, cat_category, cat_subcategory, cat_product
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """
             for item in t.get("itens", []):
                 cat = item.get("hierarquia_categorias") or {}
-                valores_item = (
-                    transacao_id, 
+                item_values = (
+                    transaction_id, t_type,
                     str(item.get("numero_item_nota") or "").upper(), 
                     str(item.get("codigo_produto") or "").upper(),
                     str(item.get("item") or "PRODUTO DESCONHECIDO").upper(), 
@@ -219,20 +258,24 @@ def salvar_transacoes_no_banco(dados_json):
                     str(cat.get("subcategoria") or "").upper(), 
                     str(cat.get("produto") or "").upper()
                 )
-                cursor.execute(sql_item, valores_item)
+                cursor.execute(sql_item, item_values)
 
-            sql_parcela = """
-                INSERT INTO parcelas (transacao_id, mes, data_vencimento, valor)
-                VALUES (%s, %s, %s, %s);
+            # Insert Installments (AP/AR Ledger)
+            sql_installment = """
+                INSERT INTO installments (
+                    transaction_id, month, due_date, amount, payment_status, payment_date, paid_amount
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s);
             """
-            for parcela in t.get("detalhamento_parcelas", []):
-                valores_parcela = (
-                    transacao_id, parcela.get("mes"), parcela.get("data_vencimento"), float(parcela.get("valor") or 0.0)
+            for inst in t.get("detalhamento_parcelas", []):
+                inst_values = (
+                    transaction_id, inst.get("mes"), inst.get("data_vencimento"), 
+                    float(inst.get("valor") or 0.0), inst.get("status_pagamento", "PENDING"),
+                    inst.get("dt_pagamento"), float(inst.get("valor_pago") or 0.0)
                 )
-                cursor.execute(sql_parcela, valores_parcela)
+                cursor.execute(sql_installment, inst_values)
 
         conn.commit()
-        return True, "Sucesso"
+        return True, "Success"
     except Exception as e:
         conn.rollback()
         return False, str(e)
@@ -240,18 +283,19 @@ def salvar_transacoes_no_banco(dados_json):
         if 'cursor' in locals(): cursor.close()
         if conn: conn.close()
 
-def buscar_cartao_db(banco, variante):
-    conn = conectar()
+def get_card_from_db(bank, variant):
+    """Retrieves credit card statement rules from DB."""
+    conn = get_db_connection()
     if not conn: return None
     try:
         cursor = conn.cursor()
-        if variante and str(variante).strip():
-            cursor.execute("SELECT dia_fechamento, dia_vencimento FROM cartoes WHERE banco ILIKE %s AND variante ILIKE %s LIMIT 1", (banco, variante))
+        if variant and str(variant).strip():
+            cursor.execute("SELECT closing_day, due_day FROM credit_cards WHERE bank ILIKE %s AND variant ILIKE %s LIMIT 1", (bank, variant))
         else:
-            cursor.execute("SELECT dia_fechamento, dia_vencimento FROM cartoes WHERE banco ILIKE %s AND (variante IS NULL OR variante = '') LIMIT 1", (banco,))
-        resultado = cursor.fetchone()
-        if resultado:
-            return {"fechamento": int(resultado[0]), "vencimento": int(resultado[1])}
+            cursor.execute("SELECT closing_day, due_day FROM credit_cards WHERE bank ILIKE %s AND (variant IS NULL OR variant = '') LIMIT 1", (bank,))
+        result = cursor.fetchone()
+        if result:
+            return {"closing": int(result[0]), "due": int(result[1])}
         return None
     except:
         return None
@@ -259,21 +303,22 @@ def buscar_cartao_db(banco, variante):
         if 'cursor' in locals(): cursor.close()
         if conn: conn.close()
 
-def salvar_cartao_db(banco, variante, fechamento, vencimento):
-    conn = conectar()
+def save_card_to_db(bank, variant, closing, due):
+    """Upserts a credit card configuration into DB."""
+    conn = get_db_connection()
     if not conn: return False
     try:
         cursor = conn.cursor()
-        if variante and str(variante).strip():
-            cursor.execute("SELECT id FROM cartoes WHERE banco ILIKE %s AND variante ILIKE %s", (banco, variante))
+        if variant and str(variant).strip():
+            cursor.execute("SELECT id FROM credit_cards WHERE bank ILIKE %s AND variant ILIKE %s", (bank, variant))
         else:
-            cursor.execute("SELECT id FROM cartoes WHERE banco ILIKE %s AND (variante IS NULL OR variante = '')", (banco,))
-        existe = cursor.fetchone()
+            cursor.execute("SELECT id FROM credit_cards WHERE bank ILIKE %s AND (variant IS NULL OR variant = '')", (bank,))
+        exists = cursor.fetchone()
 
-        if existe:
-            cursor.execute("UPDATE cartoes SET dia_fechamento = %s, dia_vencimento = %s WHERE id = %s", (int(fechamento), int(vencimento), existe[0]))
+        if exists:
+            cursor.execute("UPDATE credit_cards SET closing_day = %s, due_day = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s", (int(closing), int(due), exists[0]))
         else:
-            cursor.execute("INSERT INTO cartoes (banco, variante, dia_fechamento, dia_vencimento) VALUES (%s, %s, %s, %s)", (banco, variante if variante else "", int(fechamento), int(vencimento)))
+            cursor.execute("INSERT INTO credit_cards (bank, variant, closing_day, due_day) VALUES (%s, %s, %s, %s)", (bank, variant if variant else "", int(closing), int(due)))
         conn.commit()
         return True
     except Exception as e:
@@ -283,55 +328,90 @@ def salvar_cartao_db(banco, variante, fechamento, vencimento):
         if 'cursor' in locals(): cursor.close()
         if conn: conn.close()
 
-def listar_cartoes_db():
-    conn = conectar()
+def list_cards_from_db():
+    """Returns a list of all saved credit cards for Telegram Keyboards."""
+    conn = get_db_connection()
     if not conn: return []
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT banco, variante FROM cartoes ORDER BY banco")
-        resultados = cursor.fetchall()
-        return [{"banco": r[0], "variante": r[1] if r[1] else ""} for r in resultados]
+        cursor.execute("SELECT DISTINCT bank, variant FROM credit_cards ORDER BY bank")
+        results = cursor.fetchall()
+        return [{"bank": r[0], "variant": r[1] if r[1] else ""} for r in results]
     except:
         return []
     finally:
         if 'cursor' in locals(): cursor.close()
         if conn: conn.close()
 
-def verificar_nota_existente(numero_nota):
-    """Verifica se o número da nota fiscal já foi salvo no banco de dados."""
-    conn = conectar()
+def check_existing_invoice(invoice_number):
+    """Heuristic 1: Exact match on Invoice Number to prevent duplicates."""
+    conn = get_db_connection()
     if not conn: return False
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM transacoes WHERE numero_nota = %s LIMIT 1", (numero_nota,))
-        resultado = cursor.fetchone()
-        return bool(resultado) # Retorna True se a nota já existir, False se for nova
+        cursor.execute("SELECT id FROM transactions WHERE invoice_number = %s LIMIT 1", (invoice_number,))
+        return bool(cursor.fetchone())
     except:
         return False
     finally:
         if 'cursor' in locals(): cursor.close()
         if conn: conn.close()
 
-def verificar_transacao_semelhante(local_nome, valor_total_pago, data_compra):
-    """Verifica se já existe uma transação manual com o mesmo local, valor e data."""
-    conn = conectar()
+def check_similar_transaction(location, amount, t_date):
+    """Heuristic 2: Fuzzy match on Location, Amount, and Date to detect shadow duplicates."""
+    conn = get_db_connection()
     if not conn: return False
     try:
         cursor = conn.cursor()
-        # Procura transações com mesmo local, valor e data
         cursor.execute("""
-            SELECT id FROM transacoes 
-            WHERE local_nome = %s 
-            AND valor_total_pago = %s 
-            AND data_compra = %s
+            SELECT id FROM transactions 
+            WHERE location_name = %s 
+            AND total_amount = %s 
+            AND transaction_date = %s
             LIMIT 1
-        """, (local_nome.upper(), float(valor_total_pago), data_compra))
-        
-        resultado = cursor.fetchone()
-        return bool(resultado) # True se achar uma compra igualzinha
+        """, (location.upper(), float(amount), t_date))
+        return bool(cursor.fetchone()) 
     except Exception as e:
-        print(f"Erro na busca de similaridade: {e}")
         return False
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if conn: conn.close()
+
+def get_pending_bills_by_month(month_year):
+    """Retrieves all pending installments for a given month for the Inline UI."""
+    conn = get_db_connection()
+    if not conn: return []
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT i.id, t.location_name, i.due_date, i.amount 
+            FROM installments i
+            JOIN transactions t ON i.transaction_id = t.id
+            WHERE i.month = %s AND i.payment_status = 'PENDING'
+            ORDER BY i.due_date ASC
+        """, (month_year,))
+        results = cursor.fetchall()
+        return [{"id": r[0], "location": r[1], "due_date": r[2], "amount": float(r[3])} for r in results]
+    finally:
+        if 'cursor' in locals(): cursor.close()
+        if conn: conn.close()
+
+def pay_bill_in_db(installment_id, payment_date):
+    """Updates an installment status to PAID (AP/AR Ledger Write)."""
+    conn = get_db_connection()
+    if not conn: return False
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE installments 
+            SET payment_status = 'PAID', 
+                payment_date = %s, 
+                paid_amount = amount,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (payment_date, installment_id))
+        conn.commit()
+        return True
     finally:
         if 'cursor' in locals(): cursor.close()
         if conn: conn.close()
