@@ -18,7 +18,7 @@ from groq import AsyncGroq
 
 from database import (
     create_tables, save_transactions_to_db, get_card_from_db, save_card_to_db, list_cards_from_db, 
-    add_to_queue, get_next_in_queue, reschedule_queue_item, complete_queue_item, check_existing_invoice,
+    add_to_queue, get_next_in_queue, reschedule_queue_item, reschedule_queue_item_busy, complete_queue_item, check_existing_invoice,
     check_similar_transaction, cancel_queue_items, get_pending_bills_by_month, pay_bill_in_db
 )
 
@@ -190,9 +190,8 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
     chat_id = item['chat_id']
 
     user_state = context.application.user_data.get(chat_id, {}).get("estado")
-    
     if (chat_id in ACTIVE_CHATS) or (chat_id in TEMP_SESSION) or (user_state is not None):
-        reschedule_queue_item(item['id'], 15, item['attempts'] - 1, item['max_attempts'])
+        reschedule_queue_item_busy(item['id'], 15)
         return
 
     ACTIVE_CHATS.add(chat_id)
@@ -239,6 +238,12 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                 if check_similar_transaction(loc_check, float(tx.get("valor_total") or 0.0), tx.get("dt_transacao") or today_str):
                     tx["alerta_duplicidade"] = True
 
+            val_total = float(tx.get("valor_total") or 0.0)
+            if val_total == 0.0 and tx.get("itens"):
+                val_total = sum(float(i.get("valor_unitario", 0)) * float(i.get("quantidade", 1)) for i in tx["itens"])
+                tx["valor_total"] = round(val_total, 2)
+                print(f"[WARN] valor_total zerado. Recalculado somando itens: R$ {tx['valor_total']}")
+                
             if not tx.get("dt_transacao") or tx.get("dt_transacao") == "null": tx["dt_transacao"] = today_str
             
             for idx, it in enumerate(tx.get("itens", []), start=1):
@@ -388,6 +393,7 @@ async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard = [[InlineKeyboardButton(f"❌ {b['location'][:15]} - R$ {b['amount']:.2f} ({b['due_date'][:5]})", callback_data=f"pagar_{b['id']}")] for b in bills]
     await update.message.reply_text(f"🗓️ **Pendentes {current_month}**\nClique para pagar:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+@security_check
 async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer() 

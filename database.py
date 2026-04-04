@@ -18,12 +18,16 @@ except Exception as e:
 def parse_br_date(date_str):
     """Helper para converter string DD/MM/YYYY para objeto DATE do banco."""
     if not date_str or date_str.lower() == "null": return None
-    try: return datetime.strptime(date_str, "%d/%m/%Y").date()
-    except: return datetime.now().date()
+    try: 
+        return datetime.strptime(date_str, "%d/%m/%Y").date()
+    except Exception as e: 
+        print(f"[WARN] parse_br_date falhou para '{date_str}': {e}. Usando data de hoje.")
+        return datetime.now().date()
 
 def create_tables():
     """Creates all necessary relational tables, indexes, and constraints."""
     if not db_pool: return
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -129,6 +133,7 @@ def create_tables():
 
 def add_to_queue(chat_id, text, is_pdf):
     if not db_pool: return False
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -141,6 +146,7 @@ def add_to_queue(chat_id, text, is_pdf):
 
 def get_next_in_queue():
     if not db_pool: return None
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -163,6 +169,7 @@ def get_next_in_queue():
 
 def reschedule_queue_item(item_id, wait_seconds, attempts, max_attempts):
     if not db_pool: return
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -171,16 +178,20 @@ def reschedule_queue_item(item_id, wait_seconds, attempts, max_attempts):
         else:
             cursor.execute("""
                 UPDATE process_queue 
-                SET status = 'PENDING', attempts = %s, next_attempt = CURRENT_TIMESTAMP + INTERVAL '%s seconds'
+                SET status = 'PENDING', attempts = %s, 
+                next_attempt = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second')
                 WHERE id = %s
             """, (attempts + 1, wait_seconds, item_id))
         conn.commit()
+    except Exception as e:
+        print(f"[DB ERROR] reschedule: {e}")
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
 def complete_queue_item(item_id):
     if not db_pool: return
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -192,6 +203,7 @@ def complete_queue_item(item_id):
 
 def cancel_queue_items(chat_id):
     if not db_pool: return False
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -206,6 +218,7 @@ def cancel_queue_items(chat_id):
 
 def save_transactions_to_db(json_data):
     if not db_pool: return False, "DB Connection Failed."
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -268,6 +281,7 @@ def save_transactions_to_db(json_data):
 
 def get_card_from_db(bank, variant):
     if not db_pool: return None
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -284,6 +298,7 @@ def get_card_from_db(bank, variant):
 
 def save_card_to_db(bank, variant, closing, due):
     if not db_pool: return False
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -304,6 +319,7 @@ def save_card_to_db(bank, variant, closing, due):
 
 def list_cards_from_db():
     if not db_pool: return []
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -316,6 +332,7 @@ def list_cards_from_db():
 
 def check_existing_invoice(invoice_number):
     if not db_pool: return False
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -328,6 +345,7 @@ def check_existing_invoice(invoice_number):
 
 def check_similar_transaction(location, amount, t_date_str):
     if not db_pool: return False
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -345,6 +363,7 @@ def check_similar_transaction(location, amount, t_date_str):
 
 def get_pending_bills_by_month(month_year):
     if not db_pool: return []
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -360,6 +379,7 @@ def get_pending_bills_by_month(month_year):
 
 def pay_bill_in_db(installment_id, payment_date_str):
     if not db_pool: return False
+    conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
@@ -382,6 +402,25 @@ def pay_bill_in_db(installment_id, payment_date_str):
     except Exception as e:
         if conn: conn.rollback()
         return False
+    finally:
+        if 'cursor' in locals() and cursor: cursor.close()
+        if conn: db_pool.putconn(conn)
+
+def reschedule_queue_item_busy(item_id, wait_seconds):
+    """Reagenda silenciosamente sem contar como tentativa falha quando o chat está ocupado."""
+    if not db_pool: return
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE process_queue SET status = 'PENDING',
+            next_attempt = CURRENT_TIMESTAMP + (%s * INTERVAL '1 second')
+            WHERE id = %s
+        """, (wait_seconds, item_id))
+        conn.commit()
+    except Exception as e:
+        print(f"[DB ERROR] reschedule_busy: {e}")
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
