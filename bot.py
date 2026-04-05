@@ -43,7 +43,7 @@ ESTRUTURA DE SAÍDA OBRIGATÓRIA (Apenas JSON):
   "mensagem_interacao": "Ok",
   "cabecalho": {
     "tipo_transacao": "RECEITA ou DESPESA",
-    "local": "NOME DA EMPRESA fornecedora. 🚨 Se não souber ou não for claro, retorne 'Não Informado'.",
+    "local": "NOME DA EMPRESA fornecedora (Ex: Ultragaz, Copel). 🚨 NUNCA use o endereço do cliente. Se a empresa não estiver clara, deduza pela URL (ex: 'minhaultragaz' = Ultragaz). Se mesmo assim não ficar claro, retorne Não Informado.",
     "_raciocinio_vencimento": "1. PDF convertido perde formatação. 2. PROIBIDO usar 'DATA DE EMISSÃO'. Ignore datas perto de SÉRIE/Protocolo. 3. Vencimento costuma ser linha com 'Mês/Ano Data Valor'. Qual é o vencimento real e por quê?",
     "dt_transacao": "DD/MM/YYYY (Use a data de VENCIMENTO descoberta no raciocínio. Para compras normais, a data da compra)",
     "numero_nota": "Número da nota ou null",

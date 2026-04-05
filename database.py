@@ -6,9 +6,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
+conn = None
 
 # --- PROD-01: Connection Pool ---
-# Cria um pool de conexões (Mínimo 1, Máximo 10) para reaproveitamento rápido
 try:
     db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
 except Exception as e:
@@ -16,7 +16,6 @@ except Exception as e:
     db_pool = None
 
 def parse_br_date(date_str):
-    """Helper para converter string DD/MM/YYYY para objeto DATE do banco."""
     if not date_str or date_str.lower() == "null": return None
     try: 
         return datetime.strptime(date_str, "%d/%m/%Y").date()
@@ -25,7 +24,6 @@ def parse_br_date(date_str):
         return datetime.now().date()
 
 def create_tables():
-    """Creates all necessary relational tables, indexes, and constraints."""
     if not db_pool: return
     conn = None
     try:
@@ -40,7 +38,7 @@ def create_tables():
                 is_pdf BOOLEAN,
                 status VARCHAR(20) DEFAULT 'PENDING',
                 attempts INT DEFAULT 0,
-                max_attempts INT DEFAULT 5, -- PROD-03: Fila Zumbi
+                max_attempts INT DEFAULT 5,
                 next_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 json_result TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -96,7 +94,7 @@ def create_tables():
             CREATE TABLE IF NOT EXISTS installments (
                 id SERIAL PRIMARY KEY,
                 transaction_id INT REFERENCES transactions(id) ON DELETE CASCADE,
-                month VARCHAR(7) CHECK (month ~ '^\\d{2}/\\d{4}$'), -- BARRAS DUPLAS AQUI
+                month VARCHAR(7) CHECK (month ~ '^\\d{2}/\\d{4}$'),
                 due_date DATE,
                 amount DECIMAL(10, 2),
                 payment_status VARCHAR(20) DEFAULT 'PENDING',
@@ -350,7 +348,6 @@ def check_similar_transaction(location, amount, t_date_str):
         conn = db_pool.getconn()
         cursor = conn.cursor()
         t_date = parse_br_date(t_date_str)
-        # QUAL-04: ILIKE para case-insensitive
         cursor.execute("""
             SELECT id FROM transactions 
             WHERE location_name ILIKE %s AND total_amount = %s AND transaction_date = %s LIMIT 1
@@ -361,6 +358,7 @@ def check_similar_transaction(location, amount, t_date_str):
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
+# --- SPRINT 2: MOTOR DE BUSCA COM DADOS DO CARTÃO E ATRASO ---
 def get_pending_bills_by_month(month_year):
     if not db_pool: return []
     conn = None
@@ -368,16 +366,40 @@ def get_pending_bills_by_month(month_year):
         conn = db_pool.getconn()
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT i.id, t.location_name, to_char(i.due_date, 'DD/MM/YYYY'), i.amount 
+            SELECT i.id, t.location_name, to_char(i.due_date, 'DD/MM/YYYY'), i.amount, 
+                   t.card_bank, t.card_variant, (i.due_date < CURRENT_DATE) as is_overdue
             FROM installments i JOIN transactions t ON i.transaction_id = t.id
             WHERE i.month = %s AND i.payment_status = 'PENDING' ORDER BY i.due_date ASC
         """, (month_year,))
-        return [{"id": r[0], "location": r[1], "due_date": r[2], "amount": float(r[3])} for r in cursor.fetchall()]
+        return [{
+            "id": r[0], "location": r[1], "due_date": r[2], "amount": float(r[3]),
+            "bank": r[4], "variant": r[5], "is_overdue": bool(r[6])
+        } for r in cursor.fetchall()]
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
-def pay_bill_in_db(installment_id, payment_date_str):
+# --- SPRINT 2: ALERTA GLOBAL DE ATRASOS ---
+def get_all_overdue_installments():
+    """Busca qualquer conta pendente cuja data de vencimento já tenha passado."""
+    if not db_pool: return []
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT i.id, t.location_name, to_char(i.due_date, 'DD/MM/YYYY'), i.amount, i.month
+            FROM installments i JOIN transactions t ON i.transaction_id = t.id
+            WHERE i.payment_status = 'PENDING' AND i.due_date < CURRENT_DATE
+            ORDER BY i.due_date ASC
+        """)
+        return [{"id": r[0], "location": r[1], "due_date": r[2], "amount": float(r[3]), "month": r[4]} for r in cursor.fetchall()]
+    finally:
+        if 'cursor' in locals() and cursor: cursor.close()
+        if conn: db_pool.putconn(conn)
+
+# --- SPRINT 2: MOTOR DE DESCONTO E ANTECIPAÇÃO ---
+def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
     if not db_pool: return False
     conn = None
     try:
@@ -385,13 +407,34 @@ def pay_bill_in_db(installment_id, payment_date_str):
         cursor = conn.cursor()
         pay_date = parse_br_date(payment_date_str)
         
+        # 1. Pega o valor original da parcela
+        cursor.execute("SELECT amount, transaction_id FROM installments WHERE id = %s", (installment_id,))
+        row = cursor.fetchone()
+        if not row: return False
+        original_amount, transaction_id = row
+        
+        # 2. Calcula o desconto (se você pagou menos, a diferença é desconto)
+        final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else float(original_amount)
+        discount = float(original_amount) - final_paid_amount
+
+        # 3. Baixa a Parcela
         cursor.execute("""
-            UPDATE installments SET payment_status = 'PAID', payment_date = %s, paid_amount = amount, updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s RETURNING transaction_id
-        """, (pay_date, installment_id))
+            UPDATE installments 
+            SET payment_status = 'PAID', payment_date = %s, paid_amount = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (pay_date, final_paid_amount, installment_id))
         
-        transaction_id = cursor.fetchone()[0]
+        # 4. Se houve lucro/desconto, reduz o total da transação e soma no 'discount_applied'
+        if discount != 0.0:
+            cursor.execute("""
+                UPDATE transactions 
+                SET discount_applied = COALESCE(discount_applied, 0) + %s,
+                    total_amount = total_amount - %s,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (discount, discount, transaction_id))
         
+        # 5. Verifica se todas as parcelas foram pagas para baixar a transação pai
         cursor.execute("SELECT count(*) FROM installments WHERE transaction_id = %s AND payment_status = 'PENDING'", (transaction_id,))
         pending_count = cursor.fetchone()[0]
         if pending_count == 0:
@@ -400,6 +443,26 @@ def pay_bill_in_db(installment_id, payment_date_str):
         conn.commit()
         return True
     except Exception as e:
+        print(f"[DB ERROR] pay_bill: {e}")
+        if conn: conn.rollback()
+        return False
+    finally:
+        if 'cursor' in locals() and cursor: cursor.close()
+        if conn: db_pool.putconn(conn)
+
+# --- SPRINT 3 PRECURSOR: SOFT DELETE PARA CONCILIAÇÃO BANCÁRIA ---
+def cancel_installment(installment_id):
+    """Marca uma única parcela como cancelada/estornada (Conciliação de Cartão)."""
+    if not db_pool: return False
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE installments SET payment_status = 'CANCELED', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (installment_id,))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DB ERROR] cancel_installment: {e}")
         if conn: conn.rollback()
         return False
     finally:
@@ -407,7 +470,6 @@ def pay_bill_in_db(installment_id, payment_date_str):
         if conn: db_pool.putconn(conn)
 
 def reschedule_queue_item_busy(item_id, wait_seconds):
-    """Reagenda silenciosamente sem contar como tentativa falha quando o chat está ocupado."""
     if not db_pool: return
     conn = None
     try:
