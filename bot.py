@@ -43,7 +43,7 @@ ESTRUTURA DE SAÍDA OBRIGATÓRIA (Apenas JSON):
   "mensagem_interacao": "Ok",
   "cabecalho": {
     "tipo_transacao": "RECEITA ou DESPESA",
-    "local": "NOME DA EMPRESA fornecedora (Ex: Ultragaz, Copel). 🚨 NUNCA use o endereço do cliente. Se a empresa não estiver clara, deduza pela URL (ex: 'minhaultragaz' = Ultragaz).",
+    "local": "NOME DA EMPRESA fornecedora. 🚨 Se não souber ou não for claro, retorne 'Não Informado'.",
     "_raciocinio_vencimento": "1. PDF convertido perde formatação. 2. PROIBIDO usar 'DATA DE EMISSÃO'. Ignore datas perto de SÉRIE/Protocolo. 3. Vencimento costuma ser linha com 'Mês/Ano Data Valor'. Qual é o vencimento real e por quê?",
     "dt_transacao": "DD/MM/YYYY (Use a data de VENCIMENTO descoberta no raciocínio. Para compras normais, a data da compra)",
     "numero_nota": "Número da nota ou null",
@@ -51,7 +51,7 @@ ESTRUTURA DE SAÍDA OBRIGATÓRIA (Apenas JSON):
     "valor_total_bruto": 0.00,
     "desconto_total": 0.00,
     "valor_total": 0.00,
-    "metodo_pagamento": "Dinheiro, Cartão de Crédito, Cartão de Débito, Pix, Boleto, Conta Corrente ou null",
+    "metodo_pagamento": "Dinheiro, Cartão de Crédito, Cartão de Débito, Pix, Boleto, Conta Corrente, Financiamento ou null",
     "quantidade_parcelas": 1,
     "cartao": { "banco": "Banco ou null", "variante": "Variante ou null" }
   },
@@ -74,7 +74,7 @@ MAPA DE CATEGORIAS (DESPESAS):
 - Alimentação > Hortifruti | Carnes | Mercearia | Laticínios | Bebidas | Padaria | Restaurante | Limpeza
 - Moradia > Contas Residenciais (Contas de Gás, Energia, Água, etc.) | Aluguel | Manutenção
 - Transporte > Combustível | App de Transporte | Passagens | Manutenção Veicular
-- Saúde e Beleza > Farmácia | Consultas/Exames | Cuidados Pessoais
+- Saúde e Beleza > Farmácia | Consultas/Exames | Cuidados Pessoais | Higiene Pessoal
 - Lazer e Cultura > Livros | Ingressos | Jogos | Viagem
 - Educação > Cursos | Material Escolar
 - Compras > Vestuário | Eletrônicos | Casa/Móveis
@@ -140,7 +140,6 @@ def extract_json_from_response(raw_text):
     except: return None
 
 def calculate_invoice_due_date(purchase_date, closing_day, due_day):
-    """BUG-02: Fixed year rollover using relativedelta."""
     base_month = purchase_date.replace(day=1)
     if purchase_date.day >= closing_day:
         base_month += relativedelta(months=1)
@@ -148,7 +147,7 @@ def calculate_invoice_due_date(purchase_date, closing_day, due_day):
         base_month += relativedelta(months=1)
     return base_month + relativedelta(day=due_day)
 
-def generate_installment_details(total_amount, total_installments, transaction_date_str, card_rules, payment_method, transaction_type="DESPESA"):
+def generate_installment_details(total_amount, total_installments, transaction_date_str, card_rules, payment_method, transaction_type="DESPESA", first_inst_date=None):
     details = []
     actual_installments = max(1, total_installments)
     installment_value = round(total_amount / actual_installments, 2)
@@ -160,7 +159,11 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     due = int(card_rules.get("due", 0)) if card_rules else 0
     method_str = str(payment_method).lower()
     
-    if card_rules and closing == 0 and due == 0: base_date = tx_date
+    # --- LOGICA DA PRIMEIRA PARCELA PARA FINANCIAMENTO ---
+    if first_inst_date:
+        try: base_date = datetime.strptime(first_inst_date, "%d/%m/%Y")
+        except: base_date = tx_date
+    elif card_rules and closing == 0 and due == 0: base_date = tx_date
     elif "crédito" in method_str or "credito" in method_str:
         if card_rules: base_date = calculate_invoice_due_date(tx_date, closing, due)
         else: base_date = tx_date + relativedelta(months=1)
@@ -195,7 +198,6 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         return
 
     ACTIVE_CHATS.add(chat_id)
-    # ------------------------
 
     today_str = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y")
     current_attempt = item['attempts']
@@ -229,7 +231,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
             
             if inv_num and str(inv_num).lower() != "null":
                 if check_existing_invoice(inv_num):
-                    await context.bot.send_message(chat_id, f"🚫 **Duplicado!** Nota `{inv_num}` já salva.")
+                    await context.bot.send_message(chat_id, f"🚫 *Duplicado!* A nota `{inv_num}` já foi enviada.", parse_mode="Markdown")
                     complete_queue_item(item['id'])
                     return
             else:
@@ -242,7 +244,6 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
             if val_total == 0.0 and tx.get("itens"):
                 val_total = sum(float(i.get("valor_unitario", 0)) * float(i.get("quantidade", 1)) for i in tx["itens"])
                 tx["valor_total"] = round(val_total, 2)
-                print(f"[WARN] valor_total zerado. Recalculado somando itens: R$ {tx['valor_total']}")
                 
             if not tx.get("dt_transacao") or tx.get("dt_transacao") == "null": tx["dt_transacao"] = today_str
             
@@ -253,7 +254,6 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
 
         complete_queue_item(item['id'])
         
-        # AQUI É O ÚNICO LUGAR ONDE O MENU É CHAMADO
         TEMP_SESSION[chat_id] = {"transacao_pendente_json": final_json, "is_pdf": item['is_pdf'], "estado": None}
         await dispatch_confirmation_triggers(context.bot, chat_id, TEMP_SESSION[chat_id])
 
@@ -261,16 +261,39 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(e).lower()
         print(f"\n[ERRO FILA {item['id']}] Tentativa {current_attempt + 1}: {e}")
         
-        if "429" in error_msg or "rate limit" in error_msg: wait_time = 60
-        else: wait_time = min(60 * (2 ** current_attempt), 3600)
+        if "429" in error_msg or "rate limit" in error_msg: 
+            wait_seconds = 60
+            match = re.search(r'try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?', error_msg)
+            if match:
+                h = float(match.group(1) or 0)
+                m = float(match.group(2) or 0)
+                s = float(match.group(3) or 0)
+                wait_seconds = int(h * 3600 + m * 60 + s) + 15
             
-        reschedule_queue_item(item['id'], wait_time, current_attempt, max_attempts)
-        
-        if current_attempt == 0:
-            msg = "⚠️ Limite da IA atingido." if "429" in error_msg else "⚠️ Erro na leitura."
-            await context.bot.send_message(chat_id, f"{msg} Tentando em background...")
-        elif current_attempt + 1 >= max_attempts:
-            await context.bot.send_message(chat_id, "❌ **Falha Permanente:** O documento excedeu o limite de tentativas e foi descartado.")
+            br_time = datetime.now(timezone(timedelta(hours=-3))) + timedelta(seconds=wait_seconds)
+            minutos = wait_seconds / 60
+            print(f"⏳ [RATE LIMIT] Esperando {minutos:.1f} minutos. Retentativa agendada para as {br_time.strftime('%H:%M:%S')} (BRT)")
+            
+            reschedule_queue_item(item['id'], wait_seconds, current_attempt, 999)
+            
+            if current_attempt == 0:
+                await context.bot.send_message(
+                    chat_id, 
+                    f"⚠️ *IA sobrecarregada.*\n\n"
+                    f"⏳ Não se preocupe! O seu registro está salvo na fila.\n"
+                    f"A retentativa automática será em aprox. {int(minutos)} min, às *{br_time.strftime('%H:%M')}*.\n"
+                    f"Assim que conseguir, eu envio o resumo para você confirmar.",
+                    parse_mode="Markdown"
+                )
+        else: 
+            wait_time = min(60 * (2 ** current_attempt), 3600)
+            reschedule_queue_item(item['id'], wait_time, current_attempt, max_attempts)
+            
+            if current_attempt == 0:
+                await context.bot.send_message(chat_id, "⚠️ *Erro na leitura.* IA tentando fazer a leitura em segundo plano...", parse_mode="Markdown")
+            elif current_attempt + 1 >= max_attempts:
+                preview = "📄 Documento PDF" if item.get('is_pdf') else item['text'][:40].replace('\n', ' ') + "..."
+                await context.bot.send_message(chat_id, f"❌ *Falha Permanente:* Limite de tentativas excedido.\n*Ref:* `{preview}`", parse_mode="Markdown")
             
     finally:
         ACTIVE_CHATS.discard(chat_id)
@@ -288,23 +311,31 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     if variant and str(variant).strip().lower() in clean_words: variant = None
 
     current_state = user_data.get("estado")
-
     loc_name = tx.get("local_compra", {}).get("nome", "Local Desconhecido")
     tx_val = float(tx.get('valor_total') or 0.0)
+    tx_date = tx.get("dt_transacao", datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y"))
 
+    trusted_methods = ["pix", "dinheiro", "conta", "poupança", "crédito", "credito", "débito", "debito", "cartão", "cartao", "benefício", "financiamento", "boleto", "aberta"]
+    is_method_trusted = any(tm in method for tm in trusted_methods)
+    is_missing_loc = str(loc_name).strip().lower() in clean_words or "desconhecido" in str(loc_name).strip().lower()
 
     if current_state != "AGUARDANDO_CONFIRMACAO":
-        if user_data.get("is_pdf") or method in ["boleto", "desconhecido", "", "null"]:
+        if user_data.get("is_pdf") or method in clean_words or not is_method_trusted:
             user_data["estado"] = "AGUARDANDO_METODO_PAGAMENTO"
             if tx_type == "RECEITA":
-                keyboard = ReplyKeyboardMarkup([["Pix", "Conta Corrente/Poupança"], ["Dinheiro"]], resize_keyboard=True, one_time_keyboard=True)
+                keyboard = ReplyKeyboardMarkup([["Pix", "Conta Corrente/Poupança"], ["Dinheiro", "Cartão de Benefício"]], resize_keyboard=True, one_time_keyboard=True)
                 await bot.send_message(chat_id, f"📄 Recebimento de *{loc_name}* (R$ {tx_val:.2f})\nOnde esse valor entrou?", reply_markup=keyboard, parse_mode="Markdown")
             else:
-                keyboard = ReplyKeyboardMarkup([["Cartão de Crédito", "Cartão de Débito"], ["Pix", "Dinheiro"], ["⏳ Ainda não paguei (Aberto)"]], resize_keyboard=True, one_time_keyboard=True)
+                keyboard = ReplyKeyboardMarkup([["Cartão de Crédito", "Cartão de Débito"], ["Pix", "Dinheiro"], ["Financiamento", "⏳ Ainda não paguei (Aberto)"]], resize_keyboard=True, one_time_keyboard=True)
                 await bot.send_message(chat_id, f"📄 Compra em *{loc_name}* (R$ {tx_val:.2f})\nComo você pagou?", reply_markup=keyboard, parse_mode="Markdown")
             return
 
-        if "cartão" in method or "cartao" in method or "crédito" in method or "débito" in method:
+        if is_missing_loc:
+            user_data["estado"] = "AGUARDANDO_LOCAL"
+            await bot.send_message(chat_id, f"🏢 Qual foi o *Local/Nome* dessa transação no valor de R$ {tx_val:.2f}?", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+            return
+
+        if ("cartão" in method or "cartao" in method or "crédito" in method or "débito" in method) and "benefício" not in method:
             if not bank:
                 buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in list_cards_from_db()]
                 buttons.append(["➕ Adicionar Novo Cartão"])
@@ -318,9 +349,16 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
                     await bot.send_message(chat_id, f"💳 Cartão Novo: *{bank} {variant}*!\nQual *fechamento e vencimento*? (Ex: 1 e 8)", parse_mode="Markdown")
                     return
 
+        parcels = int(tx.get("quantidade_parcelas") or 1)
+        needs_first_date = "financiamento" in method or (parcels > 1 and "boleto" in method)
+        if needs_first_date and not user_data.get("primeira_parcela_definida"):
+            user_data["estado"] = "AGUARDANDO_DATA_PRIMEIRA_PARCELA"
+            await bot.send_message(chat_id, f"📅 Qual a *Data de Vencimento da 1ª Parcela*?\n*(As outras {parcels-1} parcelas cairão no mesmo dia nos meses seguintes)*\n\nExemplo: `15/05/2026`", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+            return
+
     db_card = get_card_from_db(bank, variant) if bank else None
     is_prepaid = db_card and db_card.get("closing") == 0 and db_card.get("due") == 0
-    is_cash = method in ["débito", "debito", "pix", "dinheiro", "boleto", "conta corrente", "poupança"]
+    is_cash = method in ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança"]
     
     if is_prepaid or is_cash or tx_type == "RECEITA":
         tx["quantidade_parcelas"] = 1
@@ -329,22 +367,30 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             tx["metodo_pagamento"] = "Cartão de Benefício/Pré-pago"
             method = "benefício"
 
-    tx["detalhamento_parcelas"] = generate_installment_details(float(tx.get("valor_total") or 0.0), int(tx.get("quantidade_parcelas") or 1), tx.get("dt_transacao"), db_card, method, tx_type)
+    tx["detalhamento_parcelas"] = generate_installment_details(
+        float(tx.get("valor_total") or 0.0), 
+        int(tx.get("quantidade_parcelas") or 1), 
+        tx.get("dt_transacao"), 
+        db_card, 
+        method, 
+        tx_type,
+        first_inst_date=user_data.get("primeira_parcela_definida")
+    )
     user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
     
-    loc_name = tx.get("local_compra", {}).get("nome", "Local Desconhecido")
     cat = tx.get("categoria_macro", "Não classificada")
     parcels = int(tx.get("quantidade_parcelas") or 1)
     
-    summary = f"📈 **Resumo**\n🏢 **Origem:** {loc_name}\n" if tx_type == "RECEITA" else f"🛒 **Resumo**\n📍 **Local:** {loc_name}\n"
-    summary += f"🏷️ **Categoria:** {cat}\n💰 **Valor:** R$ {float(tx.get('valor_total') or 0):.2f}\n💳 **Método:** {tx.get('metodo_pagamento')}"
+    summary = f"📈 *Resumo*\n🏢 *Origem:* {loc_name}\n📅 *Data:* {tx_date}\n" if tx_type == "RECEITA" else f"🛒 *Resumo*\n📍 *Local:* {loc_name}\n📅 *Data:* {tx_date}\n"
+    summary += f"🏷️ *Categoria:* {cat}\n💰 *Valor:* R$ {float(tx.get('valor_total') or 0):.2f}\n💳 *Método:* {tx.get('metodo_pagamento')}"
     summary += f" ({bank} {variant})\n" if bank else "\n"
-    if tx_type != "RECEITA": summary += f"📅 **Parcelas:** {parcels}x\n\n"
+    
+    if tx_type != "RECEITA": summary += f"📅 *Parcelas:* {parcels}x\n\n"
     else: summary += "\n"
     
     items_list = tx.get("itens", [])
     if items_list:
-        summary += "📋 **Itens/Detalhes:**\n"
+        summary += "📋 *Itens/Detalhes:*\n"
         for i_data in items_list[:5]:
             qty = float(i_data.get("quantidade") or 1)
             name = str(i_data.get("item") or "Produto")
@@ -352,23 +398,21 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             hier = i_data.get("hierarquia_categorias") or {}
             item_cat = hier.get("subcategoria") or hier.get("categoria") or ""
             cat_tag = f" _({item_cat})_" if item_cat else ""
-            
             summary += f"🔸 {qty}x {name} (R$ {unit_val:.2f}){cat_tag}\n"
-            
         if len(items_list) > 5:
             summary += f"   *(...e mais {len(items_list) - 5} itens)*\n"
         summary += "\n"
         
     if tx_type == "DESPESA":
-        summary += "**Vencimentos:**\n"
+        summary += "*Vencimentos:*\n"
         for p in tx.get("detalhamento_parcelas", [])[:3]:
             icon = "✅" if p['status_pagamento'] == 'PAID' else "🔹"
             summary += f"{icon} {p['data_vencimento']} - R$ {float(p.get('valor') or 0):.2f}\n"
         if parcels > 3: summary += f"...e mais {parcels - 3} parcelas.\n"
         
-    summary += f"\n📋 **ID:** `{tx.get('numero_nota')}`\n"
-    if tx.get("alerta_duplicidade"): summary += f"\n🚨 **ALERTA DE DUPLICIDADE:** Registro idêntico encontrado hoje!\n\n⚠️ **Deseja salvar NOVAMENTE?**"
-    else: summary += "\n⚠️ **Salvar no banco?**"
+    summary += f"\n📋 *ID:* `{tx.get('numero_nota')}`\n"
+    if tx.get("alerta_duplicidade"): summary += f"\n🚨 *ALERTA DE DUPLICIDADE:* Registro idêntico encontrado hoje!\n\n⚠️ *Deseja salvar NOVAMENTE?*"
+    else: summary += "\n⚠️ *Salvar no banco?*"
     
     await bot.send_message(chat_id, summary, parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup([["Sim", "Não"]], resize_keyboard=True, one_time_keyboard=True))
 
@@ -379,7 +423,7 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TEMP_SESSION.pop(chat_id, None)
     ACTIVE_CHATS.discard(chat_id)
     context.user_data.clear()
-    await update.message.reply_text("🛑 **Cancelado!** Fila limpa.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text("🛑 *Cancelado!* Fila limpa.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
 @security_check
 async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -391,7 +435,7 @@ async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     keyboard = [[InlineKeyboardButton(f"❌ {b['location'][:15]} - R$ {b['amount']:.2f} ({b['due_date'][:5]})", callback_data=f"pagar_{b['id']}")] for b in bills]
-    await update.message.reply_text(f"🗓️ **Pendentes {current_month}**\nClique para pagar:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await update.message.reply_text(f"🗓️ *Pendentes {current_month}*\nClique para pagar:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 @security_check
 async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -400,7 +444,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if query.data.startswith("pagar_"):
         context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
         context.user_data["parcela_pagamento_id"] = int(query.data.split("_")[1])
-        await context.bot.send_message(update.effective_chat.id, "📅 **Quando pagou?** (Ex: `15/04/2026` ou `hoje`).", parse_mode="Markdown")
+        await context.bot.send_message(update.effective_chat.id, "📅 *Quando pagou?* (Ex: `15/04/2026` ou `hoje`).", parse_mode="Markdown")
 
 @security_check
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -420,11 +464,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except Exception as e:
         if "PDF_CRIPTOGRAFADO" in str(e) or "PasswordRequiredException" in str(e):
-            await update.message.reply_text("❌ **Erro:** PDF protegido por senha.")
+            await update.message.reply_text("❌ *Erro:* PDF protegido por senha.", parse_mode="Markdown")
         else:
-            await update.message.reply_text("❌ **Erro:** Arquivo corrompido ou sem texto.")
+            await update.message.reply_text("❌ *Erro:* Arquivo corrompido ou sem texto.", parse_mode="Markdown")
     finally:
-        # QUAL-06: Previne vazamento de armazenamento
         if os.path.exists(pdf_path): os.remove(pdf_path)
 
 @security_check
@@ -452,24 +495,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state == "AGUARDANDO_METODO_PAGAMENTO":
             choice = update.message.text
             t = context.user_data["transacao_pendente_json"]["transacoes"][0]
-            if "aberto" in choice.lower() or "não paguei" in choice.lower():
-                t["metodo_pagamento"] = "Fatura Aberta/Boleto"
-                t["cartao"] = {"banco": None, "variante": None}
-                t["detalhamento_parcelas"] = generate_installment_details(t.get("valor_total", 0), t.get("quantidade_parcelas", 1), t.get("dt_transacao"), None, "Boleto", t.get("tipo_transacao"))
-                context.user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
-                await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
-                return
+            if "aberto" in choice.lower() or "não paguei" in choice.lower(): t["metodo_pagamento"] = "Fatura Aberta/Boleto"
+            else: t["metodo_pagamento"] = choice
+            context.user_data["estado"] = None
+            await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
+            return
 
-            t["metodo_pagamento"] = choice
-            if "Cartão" in choice:
-                buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in list_cards_from_db()] + [["➕ Adicionar Novo Cartão"]]
-                await update.message.reply_text("Qual cartão?", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True))
-                context.user_data["estado"] = "AGUARDANDO_SELECAO_CARTAO"
-            else:
-                t["cartao"] = {"banco": None, "variante": None}
-                t["detalhamento_parcelas"] = generate_installment_details(t.get("valor_total", 0), t.get("quantidade_parcelas", 1), t.get("dt_transacao"), None, choice, t.get("tipo_transacao"))
-                context.user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
-                await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
+        if state == "AGUARDANDO_LOCAL":
+            t = context.user_data["transacao_pendente_json"]["transacoes"][0]
+            if "local_compra" not in t or not isinstance(t["local_compra"], dict): t["local_compra"] = {}
+            t["local_compra"]["nome"] = update.message.text.strip()
+            context.user_data["estado"] = None
+            await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
+            return
+
+        if state == "AGUARDANDO_DATA_PRIMEIRA_PARCELA":
+            ans = update.message.text.strip()
+            if not re.match(r'\d{2}/\d{2}/\d{4}', ans):
+                await update.message.reply_text("❌ Formato inválido. Use DD/MM/YYYY (Ex: 15/05/2026).")
+                return
+            context.user_data["primeira_parcela_definida"] = ans
+            context.user_data["estado"] = None
+            await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
         if state == "AGUARDANDO_SELECAO_CARTAO":
@@ -477,20 +524,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if choice == "➕ Adicionar Novo Cartão":
                 context.user_data["estado"] = "AGUARDANDO_NOME_NOVO_CARTAO"
                 await update.message.reply_text("Qual o nome do cartão? (Ex: Nubank Ultravioleta, Itaú Black):", reply_markup=ReplyKeyboardRemove())
-            else:
-                parts = choice.split(" ", 1)
-                bank, variant = parts[0], parts[1] if len(parts) > 1 else ""
-                t = context.user_data["transacao_pendente_json"]["transacoes"][0]
-                t["cartao"] = {"banco": bank, "variante": variant}
-                
-                db_card = get_card_from_db(bank, variant)
-                if not db_card:
-                    context.user_data.update({"estado": "AGUARDANDO_DATAS_CARTAO", "pendente_banco": bank, "pendente_variante": variant})
-                    await update.message.reply_text(f"💳 Novo: *{bank} {variant}*! Fechamento e vencimento? (Ex: 1 e 8)", reply_markup=ReplyKeyboardRemove())
-                    return
-                t["detalhamento_parcelas"] = generate_installment_details(t.get("valor_total", 0), t.get("quantidade_parcelas", 1), t.get("dt_transacao"), db_card, t.get("metodo_pagamento"), t.get("tipo_transacao"))
-                context.user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
-                await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
+                return
+            parts = choice.split(" ", 1)
+            t = context.user_data["transacao_pendente_json"]["transacoes"][0]
+            t["cartao"] = {"banco": parts[0], "variante": parts[1] if len(parts) > 1 else ""}
+            context.user_data["estado"] = None
+            await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
         if state == "AGUARDANDO_NOME_NOVO_CARTAO":
@@ -505,9 +544,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if len(numbers) >= 2:
                 save_card_to_db(context.user_data["pendente_banco"], context.user_data["pendente_variante"], int(numbers[0]), int(numbers[1]))
                 await update.message.reply_text("✅ Cartão salvo!")
-                t = context.user_data["transacao_pendente_json"]["transacoes"][0]
-                t["detalhamento_parcelas"] = generate_installment_details(t.get("valor_total", 0), t.get("quantidade_parcelas", 1), t.get("dt_transacao"), {"closing": int(numbers[0]), "due": int(numbers[1])}, t.get("metodo_pagamento"), t.get("tipo_transacao"))
-                context.user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
+                context.user_data["estado"] = None
                 await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             else: await update.message.reply_text("Responda com dois números (ex: 5 e 12).")
             return
