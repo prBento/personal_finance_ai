@@ -1,53 +1,42 @@
-# Product Backlog
+# 📋 Product Backlog & Roadmap
+*(Para a versão em Português, [clique aqui](#-versão-em-português-brasileiro))*
 
-## [PT-BR] Cenários Mapeados
-
-### 🟢 Cenário Ativo: Roadmap 2 (The AI Data App)
-Foco em Engenharia de Software e Produtos de Dados.
-- [ ] **Task 1:** Configurar ambiente virtual Python e dependências base.
-- [ ] **Task 2:** Criar script de conexão básica com a API do Telegram (BotFather).
-- [ ] **Task 3:** Integrar API do Groq para extrair JSON de texto livre (Ex: "Comprei chocolate por R$5").
-- [ ] **Task 4:** Criar a API com FastAPI para receber webhooks do Telegram.
-- [ ] **Task 5:** Subir o PostgreSQL via Docker Compose.
-- [ ] **Task 6:** Conectar FastAPI ao Postgres (usando SQLAlchemy ou SQLModel).
-- [ ] **Task 7:** Criar o Dashboard base em Streamlit lendo do banco.
-
-### ⚪ Cenário Futuro: Roadmap 1 (Modern Data Stack)
-Foco em Engenharia de Dados Clássica e Governança.
-- [ ] Migrar orquestração do FastAPI para o Dagster.
-- [ ] Implementar dbt para transformação de dados (Bronze -> Silver -> Gold).
-- [ ] Substituir leitura do Dashboard por um banco OLAP (DuckDB).
-- [ ] Plugar Metabase para Self-Service BI.
-
-### ⚪ Cenário Futuro: Roadmap 3 (Agentic System & Human-in-the-Loop)
-Foco em Agentes Autônomos.
-- [ ] Refatorar extração única para múltiplos agentes (Roteador, Extrator, Validador).
-- [ ] Implementar fluxo de aprovação via Telegram (Botões Inline de Sim/Não) para categorias com baixa confiança da IA.
-- [ ] Criar Agente Analista para enviar resumos proativos semanais.
+## 👨‍💻 Autor
+**Bento**
+- GitHub: [@prBento](https://github.com/prBento)
 
 ---
 
-## [EN-US] Mapped Scenarios
+## 🇺🇸 English Version
 
-### 🟢 Active Scenario: Roadmap 2 (The AI Data App)
-Focus on Software Engineering and Data Products.
-- [ ] **Task 1:** Setup Python virtual environment and core dependencies.
-- [ ] **Task 2:** Create basic connection script with Telegram API.
-- [ ] **Task 3:** Integrate Groq API to extract JSON from raw text (e.g., "Bought chocolate for $5").
-- [ ] **Task 4:** Create FastAPI backend to handle Telegram webhooks.
-- [ ] **Task 5:** Deploy PostgreSQL via Docker Compose.
-- [ ] **Task 6:** Connect FastAPI to Postgres (using SQLAlchemy or SQLModel).
-- [ ] **Task 7:** Build base Streamlit Dashboard reading from the database.
+### ✅ Phase 1: The MVP (Completed)
+- [x] **Core Ingestion:** Telegram Bot integration & Groq LLM parsing.
+- [x] **Data Resiliency:** PostgreSQL Outbox Pattern with Exponential Backoff.
+- [x] **Document Intelligence:** Scrapers for NFC-e and PDF (Utility bills).
+- [x] **Financial Logic:** Multi-agent routing for Cash-In (Income) and Cash-Out (Expenses).
+- [x] **Interactive AP/AR:** Telegram Inline buttons to track and pay pending bills.
 
-### ⚪ Future Scenario: Roadmap 1 (Modern Data Stack)
-Focus on Classic Data Engineering and Governance.
-- [ ] Migrate orchestration from FastAPI to Dagster.
-- [ ] Implement dbt for data transformation (Bronze -> Silver -> Gold).
-- [ ] Replace Dashboard reading layer with an OLAP database (DuckDB).
-- [ ] Connect Metabase for Self-Service BI.
+### 🟢 Phase 2: Scale & Visualization (Active)
+- [ ] **Task 10 (Streamlit):** Build a real-time Financial Dashboard for spend analysis.
+- [ ] **Task 11 (FastAPI):** Transition from Long Polling to Webhooks.
+- [ ] **Task 12 (Cloud):** Deploy to Cloud PaaS (Render/Railway) with proper Secret Management.
+- [ ] **Task 13 (Anticipation):** Commands for early installment payments with discount yields.
+- [ ] **Task 14 (UX/UI AP/AR):** Enhance the `/contas` command to display credit card information (Bank/Variant) next to pending installments, allowing the user to visually group purchases belonging to the same credit card invoice.
 
-### ⚪ Future Scenario: Roadmap 3 (Agentic System & Human-in-the-Loop)
-Focus on Autonomous Agents.
-- [ ] Refactor single extraction into multi-agent workflow (Router, Extractor, Validator).
-- [ ] Implement Telegram approval flow (Inline Yes/No buttons) for low-confidence AI categorizations.
-- [ ] Create Analyst Agent to send proactive weekly summaries.
+---
+
+## 🇧🇷 Versão em Português Brasileiro
+
+### ✅ Fase 1: O MVP (Concluído)
+- [x] **Ingestão Base:** Integração com Telegram Bot e parsing via Groq LLM.
+- [x] **Resiliência de Dados:** Padrão Outbox no PostgreSQL com Backoff Exponencial.
+- [x] **Inteligência de Documentos:** Scrapers para NFC-e e leitura de PDFs (Contas de consumo).
+- [x] **Lógica Financeira:** Roteamento multi-agente para Receitas e Despesas.
+- [x] **Contas a Pagar Interativo:** Botões Inline no Telegram para rastrear e baixar dívidas.
+
+### 🟢 Fase 2: Escala e Visualização (Ativo)
+- [ ] **Task 10 (Streamlit):** Construir um Dashboard Financeiro em tempo real para análise de gastos.
+- [ ] **Task 11 (FastAPI):** Transição de Long Polling para Webhooks.
+- [ ] **Task 12 (Nuvem):** Deploy para Cloud PaaS (Render/Railway) com gestão de segredos.
+- [ ] **Task 13 (Antecipação):** Comandos para pagamento antecipado de parcelas com cálculo de desconto.
+- [ ] **Task 14 (UX/UI Contas a Pagar):** Melhorar o comando `/contas` para exibir a informação do cartão de crédito (Banco/Variante) ao lado da parcela pendente, permitindo agrupar visualmente as compras que pertencem à mesma fatura.
