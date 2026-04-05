@@ -23,17 +23,25 @@ from database import (
     get_all_overdue_installments, cancel_installment
 )
 
+# --- Environment & Configuration ---
 ENV = os.getenv("ENVIRONMENT", "dev").lower()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN_PROD") if ENV == "prod" else os.getenv("TELEGRAM_TOKEN_DEV")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY_PROD") if ENV == "prod" else os.getenv("GROQ_API_KEY_DEV")
 
+# Whitelist: Only these Telegram User IDs can interact with the bot. Essential for personal finance security.
 ALLOWED_CHAT_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip()]
 
+# Asynchronous LLM Client
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
+
+# Global State Managers
+# TEMP_SESSION holds the parsed JSON temporarily while the bot asks the user for missing info.
 TEMP_SESSION = {}
+# ACTIVE_CHATS prevents the background queue from interrupting a user who is actively answering a questionnaire.
 ACTIVE_CHATS = set()
 
-# --- Prompts ---
+# --- Prompts (Two-Agent Architecture) ---
+# Agent 1 focuses ONLY on Data Extraction. It parses raw text/PDFs into a rigid JSON structure.
 PROMPT_AGENTE_1 = """
 Você é um extrator de dados de notas fiscais e textos financeiros. Hoje é [DATA_ATUAL].
 Sua função é ler o texto e extrair os dados. Se o texto for informal, deduza o local e os itens.
@@ -67,6 +75,8 @@ ESTRUTURA DE SAÍDA OBRIGATÓRIA (Apenas JSON):
 }
 """
 
+# Agent 2 takes the JSON from Agent 1 and applies Business Rules and Categorization.
+# Splitting this into two steps dramatically reduces AI hallucinations.
 PROMPT_AGENTE_2 = """
 Você é um Analista Financeiro Sênior. Hoje é [DATA_ATUAL].
 Sua missão é enriquecer e categorizar o JSON recebido.
@@ -114,6 +124,10 @@ ESTRUTURA DO JSON FINAL:
 """
 
 def security_check(func):
+    """
+    Decorator that acts as a bouncer for all Telegram handlers.
+    If the user's chat_id is not in ALLOWED_CHAT_IDS, the request is silently dropped.
+    """
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS:
             print(f"🚨 Acesso negado para ID: {update.effective_chat.id}")
@@ -122,6 +136,7 @@ def security_check(func):
     return wrapper
 
 def extract_text_from_url(url):
+    """Web scraping fallback. If the user sends a URL (like an NFC-e link), it fetches the HTML and extracts raw text."""
     try:
         response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -130,6 +145,10 @@ def extract_text_from_url(url):
     except Exception as e: return f"Erro ao acessar link: {str(e)}"
 
 def extract_json_from_response(raw_text):
+    """
+    LLM outputs often contain conversational fluff (e.g., "Here is your JSON: ```json ... ```").
+    This regex forces the extraction of ONLY the JSON block, cleaning up common formatting errors.
+    """
     match = re.search(r'\{[\s\S]*\}', raw_text)
     if not match: return None
     json_text = match.group(0)
@@ -140,6 +159,10 @@ def extract_json_from_response(raw_text):
     except: return None
 
 def calculate_invoice_due_date(purchase_date, closing_day, due_day):
+    """
+    Calculates the exact due date of a credit card invoice based on the purchase date
+    and the specific bank's rules (closing/due days) saved in the database.
+    """
     base_month = purchase_date.replace(day=1)
     if purchase_date.day >= closing_day:
         base_month += relativedelta(months=1)
@@ -148,6 +171,11 @@ def calculate_invoice_due_date(purchase_date, closing_day, due_day):
     return base_month + relativedelta(day=due_day)
 
 def generate_installment_details(total_amount, total_installments, transaction_date_str, card_rules, payment_method, transaction_type="DESPESA", first_inst_date=None):
+    """
+    The Accounts Payable (AP) Engine. 
+    It splits a total amount into 'n' installments, assigning precise due dates
+    and determining if the installment is immediately 'PAID' (like Pix/Cash) or 'PENDING' (Credit/Financing).
+    """
     details = []
     actual_installments = max(1, total_installments)
     installment_value = round(total_amount / actual_installments, 2)
@@ -159,6 +187,7 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     due = int(card_rules.get("due", 0)) if card_rules else 0
     method_str = str(payment_method).lower()
     
+    # Determines the baseline date for the first installment
     if first_inst_date:
         try: base_date = datetime.strptime(first_inst_date, "%d/%m/%Y")
         except: base_date = tx_date
@@ -176,6 +205,7 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     paid_value = installment_value if payment_status == "PAID" else 0.0
 
     for i in range(actual_installments):
+        # relativedelta perfectly jumps exact months (e.g., 15/05 -> 15/06 -> 15/07)
         installment_date = base_date + relativedelta(months=i)
         details.append({
             "mes": installment_date.strftime("%m/%Y"), 
@@ -186,12 +216,18 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     return details
 
 async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Background Worker Pattern (The core of data resilience).
+    This function runs continuously every 10 seconds. It pulls items from the DB outbox,
+    sends them to the Groq LLM, and handles rate limits without blocking the Telegram Chat.
+    """
     item = get_next_in_queue()
     if not item: return
 
     chat_id = item['chat_id']
-
     user_state = context.application.user_data.get(chat_id, {}).get("estado")
+    
+    # Busy check: If the user is answering a questionnaire, pause the queue for this chat
     if (chat_id in ACTIVE_CHATS) or (chat_id in TEMP_SESSION) or (user_state is not None):
         reschedule_queue_item_busy(item['id'], 15)
         return
@@ -211,6 +247,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         prompt_1 = PROMPT_AGENTE_1.replace("[DATA_ATUAL]", today_str)
         prompt_2 = PROMPT_AGENTE_2.replace("[DATA_ATUAL]", today_str)
         
+        # LLM Call 1: Extraction
         chat_ext = await groq_client.chat.completions.create(
             messages=[{"role": "system", "content": prompt_1}, {"role": "user", "content": text_to_process}],
             model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0.0, max_tokens=8000
@@ -218,6 +255,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         json_ext = extract_json_from_response(chat_ext.choices[0].message.content)
         if not json_ext: raise Exception("Falha na Estruturação.")
 
+        # LLM Call 2: Enrichment
         chat_enr = await groq_client.chat.completions.create(
             messages=[{"role": "system", "content": prompt_2}, {"role": "user", "content": json.dumps(json_ext, ensure_ascii=False)}],
             model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0.1, max_tokens=8000
@@ -225,9 +263,11 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         final_json = extract_json_from_response(chat_enr.choices[0].message.content)
         if not final_json: raise Exception("Falha na Categorização.")
 
+        # Pre-Processing and Idempotency Checks before asking the user
         for tx in final_json.get("transacoes", []):
             inv_num = tx.get("numero_nota")
             
+            # Check 1: Exact invoice duplicate
             if inv_num and str(inv_num).lower() != "null":
                 if check_existing_invoice(inv_num):
                     await context.bot.send_message(chat_id, f"🚫 *Duplicado!* A nota `{inv_num}` já foi enviada.", parse_mode="Markdown")
@@ -236,9 +276,11 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
             else:
                 tx["numero_nota"] = f"M-{random.randint(100000000, 999999999)}"
                 loc_check = str(tx.get("local_compra", {}).get("nome", "DESCONHECIDO")).upper()
+                # Check 2: Heuristic duplicate (Same Place, Same Money, Same Date)
                 if check_similar_transaction(loc_check, float(tx.get("valor_total") or 0.0), tx.get("dt_transacao") or today_str):
                     tx["alerta_duplicidade"] = True
 
+            # Fixes zeroes
             val_total = float(tx.get("valor_total") or 0.0)
             if val_total == 0.0 and tx.get("itens"):
                 val_total = sum(float(i.get("valor_unitario", 0)) * float(i.get("quantidade", 1)) for i in tx["itens"])
@@ -253,6 +295,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
 
         complete_queue_item(item['id'])
         
+        # Passes the processed JSON to the State Machine Evaluator
         TEMP_SESSION[chat_id] = {"transacao_pendente_json": final_json, "is_pdf": item['is_pdf'], "estado": None}
         await dispatch_confirmation_triggers(context.bot, chat_id, TEMP_SESSION[chat_id])
 
@@ -260,29 +303,30 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         error_msg = str(e).lower()
         print(f"\n[ERRO FILA {item['id']}] Tentativa {current_attempt + 1}: {e}")
         
+        # Rate Limit Handler (Protects against LLM bans)
         if "429" in error_msg or "rate limit" in error_msg: 
             br_now = datetime.now(timezone(timedelta(hours=-3)))
             wait_seconds = 60
             
-            # --- MELHORIA SPRINT 2: LIMITE TPD vs LIMITE RPM ---
+            # TPD (Tokens Per Day) check -> Defers to 9 AM next day
             if "tokens per day" in error_msg or "tpd" in error_msg:
-                # Calcula os segundos até 09:00 AM do dia seguinte
                 next_day = br_now + timedelta(days=1)
                 next_9am = next_day.replace(hour=9, minute=0, second=0, microsecond=0)
                 wait_seconds = int((next_9am - br_now).total_seconds())
                 
                 print(f"⏳ [RATE LIMIT TPD] Limite diário estourado. Retentativa agendada para as 09:00 de amanhã (BRT).")
-                reschedule_queue_item(item['id'], wait_seconds, current_attempt, 999)
+                reschedule_queue_item(item['id'], wait_seconds, current_attempt, 999) # 999 prevents permanent failure
                 
                 if current_attempt == 0:
                     await context.bot.send_message(
                         chat_id, 
-                        f"⚠️ *IA sobrecarregada.*\n\n"
+                        f"⚠️ *Limite Diário da IA atingido (TPD).* 🛑\n\n"
                         f"⏳ O seu registro está salvo na fila de espera.\n"
                         f"A retentativa automática ocorrerá amanhã a partir das *09:00h*.\n"
                         f"Assim que processado, envio o resumo para você confirmar.",
                         parse_mode="Markdown"
                     )
+            # Standard RPM/TPM check -> Extracts wait time from error log
             else:
                 match = re.search(r'try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?', error_msg)
                 if match:
@@ -306,6 +350,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                         f"Assim que conseguir, eu envio o resumo para você confirmar.",
                         parse_mode="Markdown"
                     )
+        # Standard errors (Exponential Backoff up to max_attempts)
         else: 
             wait_time = min(60 * (2 ** current_attempt), 3600)
             reschedule_queue_item(item['id'], wait_time, current_attempt, max_attempts)
@@ -320,6 +365,13 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         ACTIVE_CHATS.discard(chat_id)
 
 async def dispatch_confirmation_triggers(bot, chat_id, user_data):
+    """
+    The Cascading Central Evaluator (State Machine Core).
+    Instead of asking everything blindly, it evaluates the JSON from top to bottom.
+    If ANY crucial information is missing (Method, Location, Card Bank, Installment Date),
+    it halts the execution, sets a state (e.g., 'AGUARDANDO_LOCAL'), and asks the user.
+    Once answered, it evaluates again until the JSON is perfectly valid to generate the Markdown summary.
+    """
     tx = user_data["transacao_pendente_json"]["transacoes"][0]
     tx_type = str(tx.get("tipo_transacao", "DESPESA")).upper()
     method = str(tx.get("metodo_pagamento")).lower() if tx.get("metodo_pagamento") else "desconhecido"
@@ -336,11 +388,13 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     tx_val = float(tx.get('valor_total') or 0.0)
     tx_date = tx.get("dt_transacao", datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y"))
 
+    # Whitelists prevent the LLM from inventing fake payment methods
     trusted_methods = ["pix", "dinheiro", "conta", "poupança", "crédito", "credito", "débito", "debito", "cartão", "cartao", "benefício", "financiamento", "boleto", "aberta"]
     is_method_trusted = any(tm in method for tm in trusted_methods)
     is_missing_loc = str(loc_name).strip().lower() in clean_words or "desconhecido" in str(loc_name).strip().lower()
 
     if current_state != "AGUARDANDO_CONFIRMACAO":
+        # Step 1: Validate Payment Method
         if user_data.get("is_pdf") or method in clean_words or not is_method_trusted:
             user_data["estado"] = "AGUARDANDO_METODO_PAGAMENTO"
             if tx_type == "RECEITA":
@@ -351,11 +405,13 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
                 await bot.send_message(chat_id, f"📄 Compra em *{loc_name}* (R$ {tx_val:.2f})\nComo você pagou?", reply_markup=keyboard, parse_mode="Markdown")
             return
 
+        # Step 2: Validate Location
         if is_missing_loc:
             user_data["estado"] = "AGUARDANDO_LOCAL"
             await bot.send_message(chat_id, f"🏢 Qual foi o *Local/Nome* dessa transação no valor de R$ {tx_val:.2f}?", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
             return
 
+        # Step 3: Validate Card Info (if applicable)
         if ("cartão" in method or "cartao" in method or "crédito" in method or "débito" in method) and "benefício" not in method:
             if not bank:
                 buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in list_cards_from_db()]
@@ -365,11 +421,13 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
                 return
             else:
                 db_card = get_card_from_db(bank, variant)
+                # If the card is unknown, pause and learn its rules (upsert logic)
                 if not db_card:
                     user_data.update({"estado": "AGUARDANDO_DATAS_CARTAO", "pendente_banco": bank, "pendente_variante": variant})
                     await bot.send_message(chat_id, f"💳 Cartão Novo: *{bank} {variant}*!\nQual *fechamento e vencimento*? (Ex: 1 e 8)", parse_mode="Markdown")
                     return
 
+        # Step 4: Validate Target Date for long-term debts
         parcels = int(tx.get("quantidade_parcelas") or 1)
         needs_first_date = "financiamento" in method or (parcels > 1 and "boleto" in method)
         if needs_first_date and not user_data.get("primeira_parcela_definida"):
@@ -377,6 +435,7 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             await bot.send_message(chat_id, f"📅 Qual a *Data de Vencimento da 1ª Parcela*?\n*(As outras {parcels-1} parcelas cairão no mesmo dia nos meses seguintes)*\n\nExemplo: `15/05/2026`", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
             return
 
+    # Once all cascades pass, generate the final parsed data
     db_card = get_card_from_db(bank, variant) if bank else None
     is_prepaid = db_card and db_card.get("closing") == 0 and db_card.get("due") == 0
     is_cash = method in ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança"]
@@ -399,6 +458,7 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     )
     user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
     
+    # --- UI: Markdown Summary Building ---
     cat = tx.get("categoria_macro", "Não classificada")
     parcels = int(tx.get("quantidade_parcelas") or 1)
     
@@ -439,6 +499,7 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
 
 @security_check
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Flushes the database queue for the user and clears their active session states."""
     chat_id = update.effective_chat.id
     cancel_queue_items(chat_id)
     TEMP_SESSION.pop(chat_id, None)
@@ -447,11 +508,17 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🛑 *Cancelado!* Fila limpa.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
 async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str):
+    """
+    Renders the interactive AP Dashboard on Telegram.
+    Includes Overdue Alerts, Inline Button Pagination (⬅️ ➡️), and dynamically formats
+    payment statuses.
+    """
     bills = get_pending_bills_by_month(target_month)
     overdue_all = get_all_overdue_installments()
     overdue_other = [b for b in overdue_all if b['month'] != target_month]
 
     text = f"🗓️ *Contas Pendentes - {target_month}*\n"
+    # Global warning for bills forgotten in past months
     if overdue_other:
         text += f"\n🚨 *ATENÇÃO:* Você tem {len(overdue_other)} contas *VENCIDAS* em outros meses!\n"
 
@@ -466,6 +533,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             btn_text = f"{icon} {b['location'][:12]}{card_tag} - R$ {b['amount']:.2f} ({b['due_date'][:5]})"
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"fatura_{b['id']}_{target_month}")])
 
+    # Date math to calculate Next and Previous month strings
     target_dt = datetime.strptime(target_month, "%m/%Y")
     prev_month = (target_dt - relativedelta(months=1)).strftime("%m/%Y")
     next_month = (target_dt + relativedelta(months=1)).strftime("%m/%Y")
@@ -483,7 +551,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 async def ask_for_payment_amount(bot, chat_id, query, bill_id, target_month, pay_date):
-    """Helper para exibir o botão de valor integral na hora de pagar"""
+    """Helper UI function. Gives the user a 1-click button to pay the exact amount, or prompts for a custom amount (discount)."""
     bills = get_pending_bills_by_month(target_month)
     bill = next((b for b in bills if b['id'] == bill_id), None)
     amount = bill['amount'] if bill else 0.0
@@ -498,11 +566,16 @@ async def ask_for_payment_amount(bot, chat_id, query, bill_id, target_month, pay
 
 @security_check
 async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for the /contas command. Defaults to the current real-world month."""
     current_month = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
     await show_bills_month(update, context, current_month)
 
 @security_check
 async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Router for all Telegram Inline Buttons (those attached beneath messages).
+    Parses the 'callback_data' string to understand user intent (Navigate, Pay, Cancel, Full Amount).
+    """
     query = update.callback_query
     await query.answer() 
     data = query.data
@@ -567,6 +640,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @security_check
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Downloads PDF files, extracts their raw text using pypdf, and injects it into the DB Queue."""
     pdf_path = f"temp_{uuid.uuid4().hex}.pdf" 
     try:
         file = await update.message.document.get_file()
@@ -591,6 +665,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @security_check
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    The Text Handler Engine.
+    This function routes ALL typed user text. If the user has an active 'estado' (state) in context.user_data,
+    it means the bot previously asked them a question. The text is treated as the answer to that state,
+    and then pushed back to the 'dispatch_confirmation_triggers' evaluator to see what's next.
+    If there is no state, the text is treated as a new financial transaction and sent to the LLM Queue.
+    """
     chat_id = update.effective_chat.id
 
     if chat_id in TEMP_SESSION:
@@ -598,6 +679,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get("estado")
     try:
+        # FSM: Paying a Bill -> Custom Date
         if state == "WAITING_FOR_PAYMENT_DATE":
             ans = update.message.text.lower().strip()
             bill_id = context.user_data.get("parcela_pagamento_id")
@@ -613,6 +695,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await ask_for_payment_amount(context.bot, chat_id, None, bill_id, target_month, pay_date)
             return
             
+        # FSM: Paying a Bill -> Custom Amount (Anticipation/Discount)
         if state == "WAITING_FOR_PAYMENT_AMOUNT":
             ans = update.message.text.lower().strip()
             bill_id = context.user_data.get("parcela_pagamento_id")
@@ -621,6 +704,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             custom_amount = None
             if ans != "ok": 
                 try:
+                    # BR currency cleanup (R$ 1.500,50 -> 1500.50)
                     clean_val = ans.replace("r$", "").replace(" ", "")
                     if "," in clean_val and "." in clean_val: clean_val = clean_val.replace(".", "").replace(",", ".")
                     elif "," in clean_val: clean_val = clean_val.replace(",", ".")
@@ -636,6 +720,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return
 
+        # FSM: Adding Transaction -> User inputs a fixed Payment Method
         if state == "AGUARDANDO_METODO_PAGAMENTO":
             choice = update.message.text
             t = context.user_data["transacao_pendente_json"]["transacoes"][0]
@@ -645,6 +730,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
+        # FSM: Adding Transaction -> LLM missed the location, user provides it
         if state == "AGUARDANDO_LOCAL":
             t = context.user_data["transacao_pendente_json"]["transacoes"][0]
             if "local_compra" not in t or not isinstance(t["local_compra"], dict): t["local_compra"] = {}
@@ -653,6 +739,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
+        # FSM: Adding Transaction -> User defines Financing/Boleto first installment date
         if state == "AGUARDANDO_DATA_PRIMEIRA_PARCELA":
             ans = update.message.text.strip()
             if not re.match(r'\d{2}/\d{2}/\d{4}', ans):
@@ -663,6 +750,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
+        # FSM: Adding Transaction -> User picks the Credit Card
         if state == "AGUARDANDO_SELECAO_CARTAO":
             choice = update.message.text
             if choice == "➕ Adicionar Novo Cartão":
@@ -676,6 +764,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
+        # FSM: Adding Transaction -> Upserting a new card (Name)
         if state == "AGUARDANDO_NOME_NOVO_CARTAO":
             parts = update.message.text.split(" ", 1)
             context.user_data.update({"pendente_banco": parts[0], "pendente_variante": parts[1] if len(parts) > 1 else "", "estado": "AGUARDANDO_DATAS_CARTAO"})
@@ -683,6 +772,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Fechamento e vencimento? (Ex: 1 e 8)")
             return
 
+        # FSM: Adding Transaction -> Upserting a new card (Dates)
         if state == "AGUARDANDO_DATAS_CARTAO":
             numbers = re.findall(r'\d+', update.message.text)
             if len(numbers) >= 2:
@@ -693,6 +783,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else: await update.message.reply_text("Responda com dois números (ex: 5 e 12).")
             return
 
+        # FSM: Adding Transaction -> Final 'Yes/No' approval before inserting into PostgreSQL
         if state == "AGUARDANDO_CONFIRMACAO":
             if update.message.text.lower() in ["sim", "s"]:
                 success, db_msg = save_transactions_to_db(context.user_data["transacao_pendente_json"])
@@ -707,6 +798,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return
 
+    # If the user has no active state, the text is a new receipt/invoice. Inject it into the Queue.
     if not state:
         add_to_queue(chat_id, update.message.text, is_pdf=False)
         await update.message.reply_text("📥 Recebido! A IA está analisando.")
@@ -715,15 +807,26 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Olá! Mande seus gastos ou PDFs de contas para análise.")
 
+# --- Application Entry Point ---
 if __name__ == '__main__':
     create_tables()
     print(f"🚀 Iniciando app em ({ENV.upper()})...")
+    
+    # Builds the Telegram Bot application loop
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    # Hooks the background worker queue_processor to run every 10 seconds asynchronously 
     app.job_queue.run_repeating(queue_processor, interval=10, first=5)
+    
+    # Registers command routers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("cancelar", cancel_command))
     app.add_handler(CommandHandler("contas", list_pending_bills)) 
+    
+    # Registers payload routers
     app.add_handler(CallbackQueryHandler(handle_inline_button)) 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    # Starts Long Polling (listening to Telegram servers)
     app.run_polling()

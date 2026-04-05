@@ -4,32 +4,65 @@ from psycopg2 import pool
 from datetime import datetime
 from dotenv import load_dotenv
 
+# Loads environment variables from the .env file (like DATABASE_URL)
 load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 conn = None
 
-# --- PROD-01: Connection Pool ---
 try:
+    # A ThreadedConnectionPool manages multiple database connections simultaneously.
+    # Since the Telegram bot uses asynchronous programming and handles multiple users
+    # at the same time, we need a thread-safe pool to avoid connection exhaustion.
+    # We set a minimum of 1 connection and a maximum of 10.
     db_pool = psycopg2.pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
 except Exception as e:
     print(f"Error initializing connection pool: {e}")
     db_pool = None
 
 def parse_br_date(date_str):
+    """
+    Parses a Brazilian formatted date string into a Python Date object.
+
+    This is crucial for PostgreSQL, which expects dates in a standard format (YYYY-MM-DD).
+    If the string is invalid or empty, it defaults to the current date to prevent
+    the database from throwing a fatal error.
+
+    Args:
+        date_str (str): Date string in "DD/MM/YYYY" format.
+
+    Returns:
+        datetime.date: A valid Python date object, or today's date if parsing fails.
+    """
+    # Checks if the string is empty or explicitly says "null"
     if not date_str or date_str.lower() == "null": return None
     try: 
+        # Converts "DD/MM/YYYY" string into a date object
         return datetime.strptime(date_str, "%d/%m/%Y").date()
     except Exception as e: 
-        print(f"[WARN] parse_br_date falhou para '{date_str}': {e}. Usando data de hoje.")
+        print(f"[WARN] parse_br_date failed for '{date_str}': {e}. Using today's date.")
+        # Fallback mechanism: return today's date if the AI hallucinated the format
         return datetime.now().date()
 
 def create_tables():
+    """
+    Initializes the database schema (Tables, Foreign Keys, and Indexes).
+
+    This function uses 'CREATE TABLE IF NOT EXISTS', meaning it's safe to run
+    every time the bot starts. It won't overwrite existing data.
+    It builds a relational structure where 'transactions' is the parent,
+    and 'transaction_items' and 'installments' are children.
+
+    Returns:
+        None
+    """
     if not db_pool: return
     conn = None
     try:
+        # Grabs an available connection from the pool
         conn = db_pool.getconn()
         cursor = conn.cursor()
         
+        # 1. Outbox Queue Table: Used for resilience and handling Groq's API limits
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS process_queue (
                 id SERIAL PRIMARY KEY,
@@ -46,6 +79,7 @@ def create_tables():
             );
         """)
 
+        # 2. Main Transactions Table: Stores the header info of the receipt/invoice
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transactions (
                 id SERIAL PRIMARY KEY,
@@ -70,6 +104,8 @@ def create_tables():
             );
         """)
         
+        # 3. Items Table: Linked to 'transactions' via Foreign Key
+        # 'ON DELETE CASCADE' means if the parent transaction is deleted, its items die with it.
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS transaction_items (
                 id SERIAL PRIMARY KEY,
@@ -90,6 +126,8 @@ def create_tables():
             );
         """)
         
+        # 4. Installments Table (Accounts Payable/Receivable Engine)
+        # Includes a CHECK constraint using Regex to ensure the month is always 'MM/YYYY'
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS installments (
                 id SERIAL PRIMARY KEY,
@@ -105,6 +143,7 @@ def create_tables():
             );
         """)
         
+        # 5. Credit Cards Registry: Stores card rules (closing/due dates)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS credit_cards (
                 id SERIAL PRIMARY KEY,
@@ -117,19 +156,32 @@ def create_tables():
             );
         """)
 
+        # Performance Indexes: Speeds up specific searches in the database (like filtering by month)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_installments_month_status ON installments(month, payment_status);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_queue_status_next ON process_queue(status, next_attempt);")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_transactions_date_type ON transactions(transaction_date, transaction_type);")
 
-        conn.commit()
+        conn.commit()  # Saves all changes to the database
     except Exception as e:
         print(f"Error creating tables: {e}")
-        if conn: conn.rollback()
+        if conn: conn.rollback()  # If any error occurs, undo everything to prevent corruption
     finally:
+        # Always close the cursor and return the connection back to the pool
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
 def add_to_queue(chat_id, text, is_pdf):
+    """
+    Inserts a new raw text or PDF payload into the Outbox Queue.
+
+    Args:
+        chat_id (int): The Telegram user ID.
+        text (str): The raw text or extracted PDF text.
+        is_pdf (bool): Flag indicating if the source was a document.
+
+    Returns:
+        bool: True if insertion was successful, False otherwise.
+    """
     if not db_pool: return False
     conn = None
     try:
@@ -143,6 +195,18 @@ def add_to_queue(chat_id, text, is_pdf):
         if conn: db_pool.putconn(conn)
 
 def get_next_in_queue():
+    """
+    Fetches the next available item from the queue safely.
+
+    CRITICAL CONCEPT: 'FOR UPDATE SKIP LOCKED'
+    This prevents "Race Conditions". If two bot workers try to read the queue
+    at the exact same millisecond, the database locks the row for Worker 1,
+    and forces Worker 2 to "skip" and grab the next available row. 
+    This ensures the same receipt is never processed twice.
+
+    Returns:
+        dict: A dictionary containing the queue item details, or None if empty.
+    """
     if not db_pool: return None
     conn = None
     try:
@@ -157,6 +221,7 @@ def get_next_in_queue():
         """)
         result = cursor.fetchone()
         if result:
+            # Immediately mark it as 'PROCESSING' so other workers ignore it
             cursor.execute("UPDATE process_queue SET status = 'PROCESSING' WHERE id = %s", (result[0],))
             conn.commit()
             return {"id": result[0], "chat_id": result[1], "text": result[2], "is_pdf": result[3], "attempts": result[4], "max_attempts": result[5]}
@@ -166,14 +231,26 @@ def get_next_in_queue():
         if conn: db_pool.putconn(conn)
 
 def reschedule_queue_item(item_id, wait_seconds, attempts, max_attempts):
+    """
+    Pushes a failed item back into the future for a retry (Exponential Backoff / Rate Limit).
+
+    Args:
+        item_id (int): The queue row ID.
+        wait_seconds (int): How many seconds into the future to schedule the next attempt.
+        attempts (int): Current number of attempts.
+        max_attempts (int): Threshold for permanent failure.
+    """
     if not db_pool: return
     conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
+        
+        # If it reached the limit, mark it as DEAD so it stops looping
         if attempts + 1 >= max_attempts:
             cursor.execute("UPDATE process_queue SET status = 'DEAD', attempts = %s WHERE id = %s", (attempts + 1, item_id))
         else:
+            # Increment attempts and push the 'next_attempt' timestamp into the future
             cursor.execute("""
                 UPDATE process_queue 
                 SET status = 'PENDING', attempts = %s, 
@@ -188,6 +265,7 @@ def reschedule_queue_item(item_id, wait_seconds, attempts, max_attempts):
         if conn: db_pool.putconn(conn)
 
 def complete_queue_item(item_id):
+    """Marks a queue item as successfully processed."""
     if not db_pool: return
     conn = None
     try:
@@ -200,6 +278,7 @@ def complete_queue_item(item_id):
         if conn: db_pool.putconn(conn)
 
 def cancel_queue_items(chat_id):
+    """Soft deletes all pending queue items for a specific user (used by the /cancelar command)."""
     if not db_pool: return False
     conn = None
     try:
@@ -215,6 +294,20 @@ def cancel_queue_items(chat_id):
         if conn: db_pool.putconn(conn)
 
 def save_transactions_to_db(json_data):
+    """
+    Master function to insert the finalized AI JSON into the relational database.
+
+    This executes a 3-step hierarchical insertion:
+    1. Inserts the parent 'transactions' row and retrieves its auto-generated ID using 'RETURNING id'.
+    2. Loops through the JSON items, inserting them into 'transaction_items' linked by the parent ID.
+    3. Loops through the generated installments, inserting them into 'installments'.
+
+    Args:
+        json_data (dict): The deeply nested, validated JSON generated by the AI and bot rules.
+
+    Returns:
+        tuple: (bool success, str error_message)
+    """
     if not db_pool: return False, "DB Connection Failed."
     conn = None
     try:
@@ -227,6 +320,8 @@ def save_transactions_to_db(json_data):
             t_type = str(t.get("tipo_transacao") or "DESPESA").upper()
             tx_date = parse_br_date(t.get("dt_transacao"))
 
+            # Step 1: Insert Parent Transaction
+            # RETURNING id allows us to grab the PostgreSQL-generated primary key immediately
             sql_transaction = """
                 INSERT INTO transactions (
                     transaction_type, invoice_number, invoice_serial, transaction_date, card_bank, card_variant,
@@ -241,8 +336,9 @@ def save_transactions_to_db(json_data):
                 str(t.get("categoria_macro") or "").upper(), t.get("metodo_pagamento"), bool(t.get("parcelado")), int(t.get("quantidade_parcelas") or 1)
             )
             cursor.execute(sql_transaction, tx_values)
-            transaction_id = cursor.fetchone()[0]
+            transaction_id = cursor.fetchone()[0] # Grabbing the returned ID
 
+            # Step 2: Insert Child Items
             sql_item = """
                 INSERT INTO transaction_items (transaction_id, item_type, item_number, product_code, description, brand, unit_price, quantity, cat_macro, cat_category, cat_subcategory, cat_product)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
@@ -257,6 +353,7 @@ def save_transactions_to_db(json_data):
                     str(cat.get("subcategoria") or "").upper(), str(cat.get("produto") or "").upper()
                 ))
 
+            # Step 3: Insert Installments (Accounts Payable tracking)
             sql_installment = """
                 INSERT INTO installments (transaction_id, month, due_date, amount, payment_status, payment_date, paid_amount)
                 VALUES (%s, %s, %s, %s, %s, %s, %s);
@@ -278,6 +375,7 @@ def save_transactions_to_db(json_data):
         if conn: db_pool.putconn(conn)
 
 def get_card_from_db(bank, variant):
+    """Fetches credit card closing/due rules to automatically calculate invoice dates."""
     if not db_pool: return None
     conn = None
     try:
@@ -295,6 +393,7 @@ def get_card_from_db(bank, variant):
         if conn: db_pool.putconn(conn)
 
 def save_card_to_db(bank, variant, closing, due):
+    """Upsert logic: Creates a new credit card or updates an existing one if the rules changed."""
     if not db_pool: return False
     conn = None
     try:
@@ -316,6 +415,7 @@ def save_card_to_db(bank, variant, closing, due):
         if conn: db_pool.putconn(conn)
 
 def list_cards_from_db():
+    """Retrieves all distinct credit cards to build the Telegram Inline Keyboard."""
     if not db_pool: return []
     conn = None
     try:
@@ -329,6 +429,7 @@ def list_cards_from_db():
         if conn: db_pool.putconn(conn)
 
 def check_existing_invoice(invoice_number):
+    """Idempotency check: Verifies if a specific invoice ID already exists to prevent duplicate ingestion."""
     if not db_pool: return False
     conn = None
     try:
@@ -342,6 +443,7 @@ def check_existing_invoice(invoice_number):
         if conn: db_pool.putconn(conn)
 
 def check_similar_transaction(location, amount, t_date_str):
+    """Heuristic check: Triggers a duplicate warning if Location, Amount, and Date match exactly."""
     if not db_pool: return False
     conn = None
     try:
@@ -358,8 +460,21 @@ def check_similar_transaction(location, amount, t_date_str):
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
-# --- SPRINT 2: MOTOR DE BUSCA COM DADOS DO CARTÃO E ATRASO ---
 def get_pending_bills_by_month(month_year):
+    """
+    Core function for the Telegram '/contas' command.
+    
+    Uses an SQL 'JOIN' to combine data from 'installments' (amount, date) and 
+    'transactions' (location, card bank). 
+    Also calculates a real-time boolean flag (is_overdue) on the database side
+    by checking if 'due_date < CURRENT_DATE'.
+
+    Args:
+        month_year (str): The target month to filter (e.g., '04/2026').
+
+    Returns:
+        list: A list of dictionaries containing formatted bill information.
+    """
     if not db_pool: return []
     conn = None
     try:
@@ -379,9 +494,12 @@ def get_pending_bills_by_month(month_year):
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
-# --- SPRINT 2: ALERTA GLOBAL DE ATRASOS ---
+
 def get_all_overdue_installments():
-    """Busca qualquer conta pendente cuja data de vencimento já tenha passado."""
+    """
+    Fetches every pending installment across ALL months that has passed its due date.
+    Used to generate a global warning banner on the Telegram UI.
+    """
     if not db_pool: return []
     conn = None
     try:
@@ -398,8 +516,24 @@ def get_all_overdue_installments():
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
-# --- SPRINT 2: MOTOR DE DESCONTO E ANTECIPAÇÃO ---
 def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
+    """
+    Marks a bill as paid and handles Anticipation Discounts.
+
+    If the user pays less than the original installment amount, the system:
+    1. Calculates the discount (Original - Paid = Discount).
+    2. Registers the exact paid amount in the installment row.
+    3. Subtracts the discount from the parent 'transactions' total_amount, 
+       keeping the financial audit perfectly balanced.
+
+    Args:
+        installment_id (int): ID of the installment being paid.
+        payment_date_str (str): Date the payment occurred.
+        custom_paid_amount (float, optional): The exact money spent.
+
+    Returns:
+        bool: True if transaction committed successfully.
+    """
     if not db_pool: return False
     conn = None
     try:
@@ -407,24 +541,24 @@ def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
         cursor = conn.cursor()
         pay_date = parse_br_date(payment_date_str)
         
-        # 1. Pega o valor original da parcela
+        # 1. Grab original amount to calculate mathematical difference
         cursor.execute("SELECT amount, transaction_id FROM installments WHERE id = %s", (installment_id,))
         row = cursor.fetchone()
         if not row: return False
         original_amount, transaction_id = row
         
-        # 2. Calcula o desconto (se você pagou menos, a diferença é desconto)
+        # 2. Calculate the discount yield
         final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else float(original_amount)
         discount = float(original_amount) - final_paid_amount
 
-        # 3. Baixa a Parcela
+        # 3. Update the specific installment
         cursor.execute("""
             UPDATE installments 
             SET payment_status = 'PAID', payment_date = %s, paid_amount = %s, updated_at = CURRENT_TIMESTAMP
             WHERE id = %s
         """, (pay_date, final_paid_amount, installment_id))
         
-        # 4. Se houve lucro/desconto, reduz o total da transação e soma no 'discount_applied'
+        # 4. If a discount occurred, adjust the parent transaction to maintain accounting integrity
         if discount != 0.0:
             cursor.execute("""
                 UPDATE transactions 
@@ -434,11 +568,11 @@ def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
                 WHERE id = %s
             """, (discount, discount, transaction_id))
         
-        # 5. Verifica se todas as parcelas foram pagas para baixar a transação pai
+        # 5. Cascading Status: If this was the last pending installment, mark the parent as 'PAID'
         cursor.execute("SELECT count(*) FROM installments WHERE transaction_id = %s AND payment_status = 'PENDING'", (transaction_id,))
         pending_count = cursor.fetchone()[0]
         if pending_count == 0:
-            cursor.execute("UPDATE transactions SET status = 'Paga', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (transaction_id,))
+            cursor.execute("UPDATE transactions SET status = 'PAID', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (transaction_id,))
             
         conn.commit()
         return True
@@ -450,9 +584,22 @@ def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
-# --- SPRINT 3 PRECURSOR: SOFT DELETE PARA CONCILIAÇÃO BANCÁRIA ---
+
 def cancel_installment(installment_id):
-    """Marca uma única parcela como cancelada/estornada (Conciliação de Cartão)."""
+    """
+    Soft Deletes a specific installment by changing its status to 'CANCELED'.
+
+    This is heavily used for Bank Reconciliation. When a user inputs their full
+    credit card invoice for the month, they can "Cancel" the individual predicted
+    installments for that month so the Streamlit Dashboard doesn't count the expense twice,
+    while leaving future installments of the same purchase untouched.
+
+    Args:
+        installment_id (int): Target row ID.
+
+    Returns:
+        bool: Success status.
+    """
     if not db_pool: return False
     conn = None
     try:
@@ -470,6 +617,11 @@ def cancel_installment(installment_id):
         if conn: db_pool.putconn(conn)
 
 def reschedule_queue_item_busy(item_id, wait_seconds):
+    """
+    Defers an item without consuming a retry attempt.
+    Used when the bot detects the user is currently answering a questionnaire (busy state),
+    so the queue pauses silently instead of interrupting the user's flow.
+    """
     if not db_pool: return
     conn = None
     try:
