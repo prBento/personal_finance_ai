@@ -25,7 +25,7 @@ The architecture is built around a **Transactional Outbox Pattern**: every input
 
 - **Multimodal Ingestion:** Accepts free-text messages, NFC-e electronic invoice URLs (web scraping), and PDF utility bills (text extraction) in a single unified pipeline.
 - **Dual-Agent AI Pipeline:** Agent 1 extracts raw entities with `temperature=0.0`; Agent 2 enriches and categorizes with `temperature=0.1`. Separation of cognitive responsibility eliminates entire classes of LLM hallucination.
-- **Resilient Outbox Queue:** All inputs are queued to PostgreSQL before any AI processing. A background worker retries failed items with Exponential Backoff (60s–3600s), with a `max_attempts` limit to prevent zombie queue items.
+- **Resilient Outbox Queue:** All inputs are queued to PostgreSQL before any AI processing. A background worker retries failed items with Exponential Backoff (60s–3600s), with a `max_attempts` limit to prevent zombie queue items. Queue acquisition uses `FOR UPDATE SKIP LOCKED` for safe concurrent processing.
 - **Human-in-the-Loop Confirmation:** Every transaction is presented as a structured Markdown summary and requires explicit user confirmation before any database write occurs.
 - **AP/AR Ledger with Installment Engine:** A custom installment calculator handles Brazilian credit card billing rules (closing day + due day → correct invoice cycle), splitting transactions across multiple months in the `installments` table.
 - **Interactive Accounts Payable (`/contas`):** Inline keyboard UI to browse pending bills for the current month and mark them as paid with a single tap and a retroactive date.
@@ -34,13 +34,23 @@ The architecture is built around a **Transactional Outbox Pattern**: every input
 
 ---
 
+### 🤖 Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Initializes the bot and displays the welcome message. |
+| `/contas` | Lists all pending bills for the current month with an inline payment keyboard. |
+| `/cancelar` | Cancels any active conversation state and clears the processing queue for the current chat. |
+
+---
+
 ### 🛠️ Tech Stack
 
 | Layer | Technology | Version |
-|-------|-----------|---------|
+|-------|-----------|---------| 
 | Language | Python | 3.10+ |
 | Conversational Interface | `python-telegram-bot` | 20.8 |
-| AI Engine | Groq API (`llama-4-scout-17b`) | — |
+| AI Engine | Groq API (`llama-4-scout-17b-16e-instruct`) | — |
 | Database | PostgreSQL (Docker / Railway) | 15 |
 | DB Driver | `psycopg2-binary` | 2.9.11 |
 | Web Scraping | `BeautifulSoup4` | 4.14.3 |
@@ -68,8 +78,8 @@ Before running the application, you need to create a bot on Telegram to get your
 
 1. **Clone the repository:**
    ```bash
-   git clone [https://github.com/prBento/finance-ai-app.git](https://github.com/prBento/finance-ai-app.git)
-   cd finance-ai-app
+   git clone https://github.com/prBento/personal_finance_ai.git
+   cd personal_finance_ai
    ```
 
 2. **Set up the Environment Variables:**
@@ -143,7 +153,7 @@ For the extraction engine, we chose a **Two-Agent Sequential Pipeline** over a s
 ### 🗂️ Project Structure
 
 ```
-finance-ai-app/
+personal_finance_ai/
 ├── bot.py              # Telegram handlers, State Machine, queue worker, AI pipeline
 ├── database.py         # All DB functions, connection pool, table creation
 ├── Procfile            # Railway process definition
@@ -197,7 +207,6 @@ This project follows the **Conventional Commits** specification:
 - [ ] **BACK-03 (PDF Decrypt):** Request PDF password mid-conversation via State Machine and decrypt in-memory.
 
 ---
----
 
 ## 🇧🇷 Versão em Português Brasileiro
 
@@ -215,12 +224,22 @@ A arquitetura é construída em torno de um **Padrão de Outbox Transacional**: 
 
 - **Ingestão Multimodal:** Aceita mensagens de texto livre, URLs de NFC-e (web scraping), e PDFs de contas de consumo (extração de texto) em um único pipeline unificado.
 - **Pipeline Dual de Agentes de IA:** Agente 1 extrai entidades brutas com `temperature=0.0`; Agente 2 enriquece e categoriza com `temperature=0.1`. A separação de responsabilidade cognitiva elimina classes inteiras de alucinação do LLM.
-- **Fila Outbox Resiliente:** Todos os inputs são enfileirados no PostgreSQL antes de qualquer processamento pela IA. Um worker em background tenta novamente os itens falhos com Backoff Exponencial (60s–3600s), com limite de `max_attempts` para prevenir itens zumbi na fila.
+- **Fila Outbox Resiliente:** Todos os inputs são enfileirados no PostgreSQL antes de qualquer processamento pela IA. Um worker em background tenta novamente os itens falhos com Backoff Exponencial (60s–3600s), com limite de `max_attempts` para prevenir itens zumbi na fila. A aquisição da fila usa `FOR UPDATE SKIP LOCKED` para garantir processamento seguro e sem condições de corrida.
 - **Confirmação Human-in-the-Loop:** Toda transação é apresentada como um resumo estruturado em Markdown e requer confirmação explícita do usuário antes de qualquer escrita no banco.
 - **Livro Caixa AP/AR com Motor de Parcelas:** Um calculador de parcelas customizado lida com as regras de faturamento de cartão de crédito brasileiro (dia de fechamento + dia de vencimento → ciclo correto da fatura), distribuindo as transações por múltiplos meses na tabela `installments`.
 - **Contas a Pagar Interativo (`/contas`):** UI com teclado inline para navegar pelas contas pendentes do mês atual e marcá-las como pagas com um único toque e uma data retroativa.
 - **Whitelist de Controle de Acesso:** Uma variável de ambiente `ALLOWED_CHAT_IDS` bloqueia todos os usuários Telegram não autorizados no nível do handler.
 - **Deploy Cloud-Native:** Roda no Railway PaaS com um `ThreadedConnectionPool` para gerenciar conexões de banco de dados eficientemente dentro dos limites da nuvem.
+
+---
+
+### 🤖 Comandos do Bot
+
+| Comando | Descrição |
+|---------|-----------|
+| `/start` | Inicializa o bot e exibe a mensagem de boas-vindas. |
+| `/contas` | Lista todas as contas pendentes do mês atual com teclado inline para pagamento. |
+| `/cancelar` | Cancela qualquer estado de conversa ativo e limpa a fila de processamento do chat atual. |
 
 ---
 
@@ -230,7 +249,7 @@ A arquitetura é construída em torno de um **Padrão de Outbox Transacional**: 
 |--------|-----------|--------|
 | Linguagem | Python | 3.10+ |
 | Interface Conversacional | `python-telegram-bot` | 20.8 |
-| Motor de IA | Groq API (`llama-4-scout-17b`) | — |
+| Motor de IA | Groq API (`llama-4-scout-17b-16e-instruct`) | — |
 | Banco de Dados | PostgreSQL (Docker / Railway) | 15 |
 | Driver de BD | `psycopg2-binary` | 2.9.11 |
 | Web Scraping | `BeautifulSoup4` | 4.14.3 |
@@ -258,8 +277,8 @@ Antes de rodar a aplicação, você precisa criar um bot no Telegram para obter 
 
 1. **Clone o repositório:**
    ```bash
-   git clone [https://github.com/prBento/finance-ai-app.git](https://github.com/prBento/finance-ai-app.git)
-   cd finance-ai-app
+   git clone https://github.com/prBento/personal_finance_ai.git
+   cd personal_finance_ai
    ```
 
 2. **Configure as Variáveis de Ambiente:**
@@ -333,7 +352,7 @@ Para o motor de extração, escolhemos um **Pipeline Sequencial de Dois Agentes*
 ### 🗂️ Estrutura do Projeto
 
 ```
-finance-ai-app/
+personal_finance_ai/
 ├── bot.py              # Handlers do Telegram, Máquina de Estados, worker da fila, pipeline de IA
 ├── database.py         # Todas as funções de BD, pool de conexões, criação de tabelas
 ├── Procfile            # Definição de processo do Railway
