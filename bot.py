@@ -19,7 +19,8 @@ from groq import AsyncGroq
 from database import (
     create_tables, save_transactions_to_db, get_card_from_db, save_card_to_db, list_cards_from_db, 
     add_to_queue, get_next_in_queue, reschedule_queue_item, reschedule_queue_item_busy, complete_queue_item, check_existing_invoice,
-    check_similar_transaction, cancel_queue_items, get_pending_bills_by_month, pay_bill_in_db
+    check_similar_transaction, cancel_queue_items, get_pending_bills_by_month, pay_bill_in_db,
+    get_all_overdue_installments, cancel_installment
 )
 
 ENV = os.getenv("ENVIRONMENT", "dev").lower()
@@ -113,7 +114,6 @@ ESTRUTURA DO JSON FINAL:
 """
 
 def security_check(func):
-    """Decorator to enforce Whitelist Security."""
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ALLOWED_CHAT_IDS and update.effective_chat.id not in ALLOWED_CHAT_IDS:
             print(f"🚨 Acesso negado para ID: {update.effective_chat.id}")
@@ -159,7 +159,6 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     due = int(card_rules.get("due", 0)) if card_rules else 0
     method_str = str(payment_method).lower()
     
-    # --- LOGICA DA PRIMEIRA PARCELA PARA FINANCIAMENTO ---
     if first_inst_date:
         try: base_date = datetime.strptime(first_inst_date, "%d/%m/%Y")
         except: base_date = tx_date
@@ -262,29 +261,51 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         print(f"\n[ERRO FILA {item['id']}] Tentativa {current_attempt + 1}: {e}")
         
         if "429" in error_msg or "rate limit" in error_msg: 
+            br_now = datetime.now(timezone(timedelta(hours=-3)))
             wait_seconds = 60
-            match = re.search(r'try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?', error_msg)
-            if match:
-                h = float(match.group(1) or 0)
-                m = float(match.group(2) or 0)
-                s = float(match.group(3) or 0)
-                wait_seconds = int(h * 3600 + m * 60 + s) + 15
             
-            br_time = datetime.now(timezone(timedelta(hours=-3))) + timedelta(seconds=wait_seconds)
-            minutos = wait_seconds / 60
-            print(f"⏳ [RATE LIMIT] Esperando {minutos:.1f} minutos. Retentativa agendada para as {br_time.strftime('%H:%M:%S')} (BRT)")
-            
-            reschedule_queue_item(item['id'], wait_seconds, current_attempt, 999)
-            
-            if current_attempt == 0:
-                await context.bot.send_message(
-                    chat_id, 
-                    f"⚠️ *IA sobrecarregada.*\n\n"
-                    f"⏳ Não se preocupe! O seu registro está salvo na fila.\n"
-                    f"A retentativa automática será em aprox. {int(minutos)} min, às *{br_time.strftime('%H:%M')}*.\n"
-                    f"Assim que conseguir, eu envio o resumo para você confirmar.",
-                    parse_mode="Markdown"
-                )
+            # --- MELHORIA SPRINT 2: LIMITE TPD vs LIMITE RPM ---
+            if "tokens per day" in error_msg or "tpd" in error_msg:
+                # Calcula os segundos até 09:00 AM do dia seguinte
+                next_day = br_now + timedelta(days=1)
+                next_9am = next_day.replace(hour=9, minute=0, second=0, microsecond=0)
+                wait_seconds = int((next_9am - br_now).total_seconds())
+                
+                print(f"⏳ [RATE LIMIT TPD] Limite diário estourado. Retentativa agendada para as 09:00 de amanhã (BRT).")
+                reschedule_queue_item(item['id'], wait_seconds, current_attempt, 999)
+                
+                if current_attempt == 0:
+                    await context.bot.send_message(
+                        chat_id, 
+                        f"⚠️ *IA sobrecarregada.*\n\n"
+                        f"⏳ O seu registro está salvo na fila de espera.\n"
+                        f"A retentativa automática ocorrerá amanhã a partir das *09:00h*.\n"
+                        f"Assim que processado, envio o resumo para você confirmar.",
+                        parse_mode="Markdown"
+                    )
+            else:
+                match = re.search(r'try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?', error_msg)
+                if match:
+                    h = float(match.group(1) or 0)
+                    m = float(match.group(2) or 0)
+                    s = float(match.group(3) or 0)
+                    wait_seconds = int(h * 3600 + m * 60 + s) + 15
+                
+                br_time = br_now + timedelta(seconds=wait_seconds)
+                minutos = wait_seconds / 60
+                print(f"⏳ [RATE LIMIT] Esperando {minutos:.1f} minutos. Retentativa agendada para as {br_time.strftime('%H:%M:%S')} (BRT)")
+                
+                reschedule_queue_item(item['id'], wait_seconds, current_attempt, 999)
+                
+                if current_attempt == 0:
+                    await context.bot.send_message(
+                        chat_id, 
+                        f"⚠️ *IA sobrecarregada.*\n\n"
+                        f"⏳ Não se preocupe! O seu registro está salvo na fila.\n"
+                        f"A retentativa automática será em aprox. {int(minutos)} min, às *{br_time.strftime('%H:%M')}*.\n"
+                        f"Assim que conseguir, eu envio o resumo para você confirmar.",
+                        parse_mode="Markdown"
+                    )
         else: 
             wait_time = min(60 * (2 ** current_attempt), 3600)
             reschedule_queue_item(item['id'], wait_time, current_attempt, max_attempts)
@@ -425,26 +446,124 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("🛑 *Cancelado!* Fila limpa.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
+async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str):
+    bills = get_pending_bills_by_month(target_month)
+    overdue_all = get_all_overdue_installments()
+    overdue_other = [b for b in overdue_all if b['month'] != target_month]
+
+    text = f"🗓️ *Contas Pendentes - {target_month}*\n"
+    if overdue_other:
+        text += f"\n🚨 *ATENÇÃO:* Você tem {len(overdue_other)} contas *VENCIDAS* em outros meses!\n"
+
+    keyboard = []
+    if not bills:
+        text += "\n🎉 Tudo pago ou sem lançamentos para este mês!"
+    else:
+        text += "\nSelecione uma conta para gerenciar:\n"
+        for b in bills:
+            icon = "🔴" if b['is_overdue'] else "🔹"
+            card_tag = f" ({b['bank']})" if b['bank'] else ""
+            btn_text = f"{icon} {b['location'][:12]}{card_tag} - R$ {b['amount']:.2f} ({b['due_date'][:5]})"
+            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"fatura_{b['id']}_{target_month}")])
+
+    target_dt = datetime.strptime(target_month, "%m/%Y")
+    prev_month = (target_dt - relativedelta(months=1)).strftime("%m/%Y")
+    next_month = (target_dt + relativedelta(months=1)).strftime("%m/%Y")
+
+    nav_row = [
+        InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}"),
+        InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"mes_{next_month}")
+    ]
+    keyboard.append(nav_row)
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+async def ask_for_payment_amount(bot, chat_id, query, bill_id, target_month, pay_date):
+    """Helper para exibir o botão de valor integral na hora de pagar"""
+    bills = get_pending_bills_by_month(target_month)
+    bill = next((b for b in bills if b['id'] == bill_id), None)
+    amount = bill['amount'] if bill else 0.0
+    
+    keyboard = [[InlineKeyboardButton(f"💰 Valor Integral (R$ {amount:.2f})", callback_data=f"payamt_full_{bill_id}")]]
+    text = f"💰 *Qual foi o valor exato pago?*\nValor integral da parcela: *R$ {amount:.2f}*\n\nSe houve desconto, *digite* o valor final pago (Ex: `150,50`).\nSe pagou o valor integral, clique no botão abaixo:"
+    
+    if query:
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    else:
+        await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
 @security_check
 async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
     current_month = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
-    bills = get_pending_bills_by_month(current_month)
-
-    if not bills:
-        await update.message.reply_text(f"🎉 Tudo pago para {current_month}!")
-        return
-
-    keyboard = [[InlineKeyboardButton(f"❌ {b['location'][:15]} - R$ {b['amount']:.2f} ({b['due_date'][:5]})", callback_data=f"pagar_{b['id']}")] for b in bills]
-    await update.message.reply_text(f"🗓️ *Pendentes {current_month}*\nClique para pagar:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    await show_bills_month(update, context, current_month)
 
 @security_check
 async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer() 
-    if query.data.startswith("pagar_"):
+    data = query.data
+
+    if data.startswith("mes_"):
+        target_month = data.split("_")[1]
+        await show_bills_month(update, context, target_month)
+
+    elif data.startswith("fatura_"):
+        parts = data.split("_")
+        bill_id = parts[1]
+        target_month = parts[2]
+        
+        text = f"⚙️ *Gerenciar Parcela*\nO que você deseja fazer com esta fatura?"
+        keyboard = [
+            [InlineKeyboardButton("💸 Pagar / Antecipar", callback_data=f"pagar_{bill_id}_{target_month}")],
+            [InlineKeyboardButton("🗑️ Cancelar (Ignorar Parcela)", callback_data=f"cancelar_{bill_id}_{target_month}")],
+            [InlineKeyboardButton("⬅️ Voltar", callback_data=f"mes_{target_month}")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("pagar_"):
+        parts = data.split("_")
+        bill_id = int(parts[1])
+        target_month = parts[2]
+        
         context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
-        context.user_data["parcela_pagamento_id"] = int(query.data.split("_")[1])
-        await context.bot.send_message(update.effective_chat.id, "📅 *Quando pagou?* (Ex: `15/04/2026` ou `hoje`).", parse_mode="Markdown")
+        context.user_data["parcela_pagamento_id"] = bill_id
+        context.user_data["parcela_target_month"] = target_month
+        
+        keyboard = [[InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_{bill_id}")]]
+        await query.edit_message_text("📅 *Qual a data do pagamento?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("paydate_hoje_"):
+        bill_id = int(data.split("_")[2])
+        target_month = context.user_data.get("parcela_target_month")
+        pay_date = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y")
+        
+        context.user_data["parcela_pagamento_data"] = pay_date
+        context.user_data["estado"] = "WAITING_FOR_PAYMENT_AMOUNT"
+        
+        await ask_for_payment_amount(context.bot, update.effective_chat.id, query, bill_id, target_month, pay_date)
+
+    elif data.startswith("payamt_full_"):
+        bill_id = int(data.split("_")[2])
+        pay_date = context.user_data.get("parcela_pagamento_data")
+        
+        if pay_bill_in_db(bill_id, pay_date, None): 
+            await query.edit_message_text(f"✅ *Conta baixada com sucesso em {pay_date}!*", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("❌ Erro ao atualizar no banco de dados.", parse_mode="Markdown")
+        context.user_data.clear()
+
+    elif data.startswith("cancelar_"):
+        parts = data.split("_")
+        bill_id = int(parts[1])
+        target_month = parts[2]
+        if cancel_installment(bill_id):
+            await query.edit_message_text("✅ *Parcela ignorada/cancelada com sucesso!*\n(Isso não apaga as outras parcelas da compra original).", parse_mode="Markdown")
+            await asyncio.sleep(2)
+            await show_bills_month(update, context, target_month)
 
 @security_check
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -482,16 +601,41 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state == "WAITING_FOR_PAYMENT_DATE":
             ans = update.message.text.lower().strip()
             bill_id = context.user_data.get("parcela_pagamento_id")
+            target_month = context.user_data.get("parcela_target_month")
+            
             pay_date = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y") if ans == "hoje" else ans
             if not re.match(r'\d{2}/\d{2}/\d{4}', pay_date):
-                await update.message.reply_text("❌ Formato inválido.")
+                await update.message.reply_text("❌ Formato inválido. Use DD/MM/YYYY ou 'hoje'.")
                 return
 
-            if pay_bill_in_db(bill_id, pay_date): await update.message.reply_text(f"✅ Baixado em `{pay_date}`!", parse_mode="Markdown")
-            else: await update.message.reply_text("❌ Erro no banco.")
+            context.user_data["parcela_pagamento_data"] = pay_date
+            context.user_data["estado"] = "WAITING_FOR_PAYMENT_AMOUNT"
+            await ask_for_payment_amount(context.bot, chat_id, None, bill_id, target_month, pay_date)
+            return
+            
+        if state == "WAITING_FOR_PAYMENT_AMOUNT":
+            ans = update.message.text.lower().strip()
+            bill_id = context.user_data.get("parcela_pagamento_id")
+            pay_date = context.user_data.get("parcela_pagamento_data")
+
+            custom_amount = None
+            if ans != "ok": 
+                try:
+                    clean_val = ans.replace("r$", "").replace(" ", "")
+                    if "," in clean_val and "." in clean_val: clean_val = clean_val.replace(".", "").replace(",", ".")
+                    elif "," in clean_val: clean_val = clean_val.replace(",", ".")
+                    custom_amount = float(clean_val)
+                except ValueError:
+                    await update.message.reply_text("❌ Valor inválido. Digite apenas números (ex: `150,50`) ou clique no botão de valor integral.", parse_mode="Markdown")
+                    return
+
+            if pay_bill_in_db(bill_id, pay_date, custom_amount): 
+                await update.message.reply_text(f"✅ *Conta baixada com sucesso em {pay_date}!*", parse_mode="Markdown")
+            else: 
+                await update.message.reply_text("❌ Erro ao atualizar no banco de dados.")
             context.user_data.clear()
             return
-        
+
         if state == "AGUARDANDO_METODO_PAGAMENTO":
             choice = update.message.text
             t = context.user_data["transacao_pendente_json"]["transacoes"][0]
@@ -523,7 +667,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             choice = update.message.text
             if choice == "➕ Adicionar Novo Cartão":
                 context.user_data["estado"] = "AGUARDANDO_NOME_NOVO_CARTAO"
-                await update.message.reply_text("Qual o nome do cartão? (Ex: Nubank Ultravioleta, Itaú Black):", reply_markup=ReplyKeyboardRemove())
+                await update.message.reply_text("Qual o nome do cartão? (Ex: Nubank Ultravioleta, Itaú Black, Caju Benefício):", reply_markup=ReplyKeyboardRemove())
                 return
             parts = choice.split(" ", 1)
             t = context.user_data["transacao_pendente_json"]["transacoes"][0]
