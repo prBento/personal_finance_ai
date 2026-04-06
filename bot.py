@@ -85,7 +85,7 @@ MAPA DE CATEGORIAS (DESPESAS):
 - Alimentação > Hortifruti | Carnes | Mercearia | Laticínios | Bebidas | Padaria | Restaurante | Limpeza
 - Moradia > Contas Residenciais (Contas de Gás, Energia, Água, etc.) | Aluguel | Manutenção
 - Transporte > Combustível | App de Transporte | Passagens | Manutenção Veicular
-- Saúde e Beleza > Farmácia | Consultas/Exames | Cuidados Pessoais | Higiene Pessoal
+- Saúde e Beleza > Farmácia | Consultas/Exames | Cuidados Pessoais | Higiene Pessoal | Academia
 - Lazer e Cultura > Livros | Ingressos | Jogos | Viagem
 - Educação > Cursos | Material Escolar
 - Compras > Vestuário | Eletrônicos | Casa/Móveis
@@ -93,6 +93,13 @@ MAPA DE CATEGORIAS (DESPESAS):
 - Outros > Despesas diversas
 MAPA DE CATEGORIAS (RECEITAS):
 - Entradas > Salário | Rendimentos | Aluguel | Reembolso | Vendas | Cashback | Outros
+
+REGRAS DE DESAMBIGUAÇÃO (CRÍTICAS — Aplique ANTES de classificar):
+- "Total Pass", "Gympass", "Smart Fit", "Bluefit" e similares são ACADEMIAS → sempre "Saúde e Beleza > Academias". NUNCA classifique como Transporte ou Lazer.
+- "Uber", "99", "inDriver", "Cabify" → "Transporte > App de Transporte". NUNCA como Lazer ou Viagem.
+- "Netflix", "Spotify", "Disney+", "Amazon Prime", "Max" → "Serviços > Assinaturas". NUNCA como Lazer.
+- Contas de "Claro", "Vivo", "TIM", "Oi", "NET" → "Moradia > Contas Residenciais". NUNCA como Serviços > Assinaturas.
+- Compras no "iFood", "Rappi", "Delivery" → "Alimentação > Restaurante". NUNCA como Transporte ou Serviços.
 
 REGRAS (CRÍTICAS):
 - valor_original: Copie "valor_total_bruto". desconto_aplicado: Copie "desconto_total".
