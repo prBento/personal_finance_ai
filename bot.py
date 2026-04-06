@@ -20,7 +20,7 @@ from database import (
     create_tables, save_transactions_to_db, get_card_from_db, save_card_to_db, list_cards_from_db, 
     add_to_queue, get_next_in_queue, reschedule_queue_item, reschedule_queue_item_busy, complete_queue_item, check_existing_invoice,
     check_similar_transaction, cancel_queue_items, get_pending_bills_by_month, pay_bill_in_db,
-    get_all_overdue_installments, cancel_installment
+    get_all_overdue_installments, cancel_installment, get_max_pending_month, pay_grouped_card_bills_in_db, get_max_month_for_transaction
 )
 
 # --- Environment & Configuration ---
@@ -507,42 +507,101 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("🛑 *Cancelado!* Fila limpa.", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
 
-async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str):
+async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str, filter_tx_id: int = None):
     """
-    Renders the interactive AP Dashboard on Telegram.
-    Includes Overdue Alerts, Inline Button Pagination (⬅️ ➡️), and dynamically formats
-    payment statuses.
+    Renders the interactive AP Dashboard.
+    If 'filter_tx_id' is provided, it enters "Isolated View", showing ONLY the installments
+    belonging to that specific transaction, hiding everything else in that month.
+    Includes 'Fast-Forward' and 'Return to Current Month' navigation.
     """
     bills = get_pending_bills_by_month(target_month)
-    overdue_all = get_all_overdue_installments()
-    overdue_other = [b for b in overdue_all if b['month'] != target_month]
-
-    text = f"🗓️ *Contas Pendentes - {target_month}*\n"
-    # Global warning for bills forgotten in past months
-    if overdue_other:
-        text += f"\n🚨 *ATENÇÃO:* Você tem {len(overdue_other)} contas *VENCIDAS* em outros meses!\n"
+    
+    # Isolation Filter
+    if filter_tx_id:
+        bills = [b for b in bills if b.get('transaction_id') == filter_tx_id]
+        overdue_other = [] # Hides global warnings in isolated view
+        text = f"🔍 *Modo Isolado - {target_month}*\nVisualizando apenas parcelas desta transação:\n"
+    else:
+        overdue_all = get_all_overdue_installments()
+        overdue_other = [b for b in overdue_all if b['month'] != target_month]
+        text = f"🗓️ *Contas Pendentes - {target_month}*\n"
+        if overdue_other:
+            text += f"\n🚨 *ATENÇÃO:* Você tem {len(overdue_other)} contas *VENCIDAS* em outros meses!\n"
 
     keyboard = []
     if not bills:
-        text += "\n🎉 Tudo pago ou sem lançamentos para este mês!"
+        text += "\n🎉 Nenhuma parcela pendente aqui!"
     else:
-        text += "\nSelecione uma conta para gerenciar:\n"
+        if not filter_tx_id:
+            text += "\nSelecione uma conta ou fatura para gerenciar:\n"
+        
+        grouped_cards = {}
+        standalone_bills = []
+        
         for b in bills:
+            if b['bank']:
+                group_key = f"{b['bank']}_{b['variant']}" if b['variant'] else b['bank']
+                if group_key not in grouped_cards:
+                    grouped_cards[group_key] = {
+                        "bank": b['bank'], "variant": b['variant'], 
+                        "total_amount": 0.0, "items": [], "due_date": b['due_date'], "is_overdue": False
+                    }
+                grouped_cards[group_key]["total_amount"] += b['amount']
+                grouped_cards[group_key]["items"].append(b)
+                if b['is_overdue']: grouped_cards[group_key]["is_overdue"] = True
+            else:
+                standalone_bills.append(b)
+                
+        # Render Grouped Cards
+        for key, card in grouped_cards.items():
+            icon = "🔴" if card['is_overdue'] else "💳"
+            v_tag = f" {card['variant']}" if card['variant'] else ""
+            display_name = f"{card['bank']}{v_tag}"
+            
+            safe_var = card['variant'] if card['variant'] else "none"
+            parent_text = f"{icon} Fatura {display_name} - R$ {card['total_amount']:.2f}"
+            keyboard.append([InlineKeyboardButton(parent_text, callback_data=f"fatgroup_{card['bank']}_{safe_var}_{target_month}")])
+            
+            for item in card['items']:
+                item_icon = "🔴" if item['is_overdue'] else "🔸"
+                child_text = f"   └ {item_icon} {item['location'][:12]} - R$ {item['amount']:.2f}"
+                keyboard.append([InlineKeyboardButton(child_text, callback_data=f"fatura_{item['id']}_{target_month}")])
+
+        # Render Standalone Bills
+        for b in standalone_bills:
             icon = "🔴" if b['is_overdue'] else "🔹"
-            card_tag = f" ({b['bank']})" if b['bank'] else ""
-            btn_text = f"{icon} {b['location'][:12]}{card_tag} - R$ {b['amount']:.2f} ({b['due_date'][:5]})"
+            btn_text = f"{icon} {b['location'][:15]} - R$ {b['amount']:.2f} ({b['due_date'][:5]})"
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"fatura_{b['id']}_{target_month}")])
 
-    # Date math to calculate Next and Previous month strings
     target_dt = datetime.strptime(target_month, "%m/%Y")
     prev_month = (target_dt - relativedelta(months=1)).strftime("%m/%Y")
     next_month = (target_dt + relativedelta(months=1)).strftime("%m/%Y")
 
+    # Navigation logic
+    tx_param = f"_tx_{filter_tx_id}" if filter_tx_id else ""
     nav_row = [
-        InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}"),
-        InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"mes_{next_month}")
+        InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}{tx_param}"),
+        InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"mes_{next_month}{tx_param}")
     ]
     keyboard.append(nav_row)
+    
+    # Contextual controls
+    if filter_tx_id:
+        keyboard.append([InlineKeyboardButton("⬅️ Voltar à Visão Geral", callback_data=f"mes_{target_month}")])
+    else:
+        max_month = get_max_pending_month()
+        if max_month and max_month != target_month and datetime.strptime(max_month, "%m/%Y") > target_dt:
+            keyboard.append([InlineKeyboardButton(f"⏭️ Pular para Último Mês ({max_month})", callback_data=f"mes_{max_month}")])
+
+    # Feature: Return to Current Month (Appears if user is time-traveling)
+    current_month_str = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
+    if target_month != current_month_str:
+        keyboard.append([InlineKeyboardButton(f"📅 Voltar para Mês Atual ({current_month_str})", callback_data=f"mes_{current_month_str}{tx_param}")])
+        
+    # Global Escape Hatch (Only in main view)
+    if not filter_tx_id:
+        keyboard.append([InlineKeyboardButton("❌ Fechar Painel", callback_data="close_panel")])
+
     markup = InlineKeyboardMarkup(keyboard)
 
     if update.callback_query:
@@ -550,14 +609,28 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     else:
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
-async def ask_for_payment_amount(bot, chat_id, query, bill_id, target_month, pay_date):
-    """Helper UI function. Gives the user a 1-click button to pay the exact amount, or prompts for a custom amount (discount)."""
-    bills = get_pending_bills_by_month(target_month)
-    bill = next((b for b in bills if b['id'] == bill_id), None)
-    amount = bill['amount'] if bill else 0.0
+async def ask_for_payment_amount(bot, chat_id, query, target_month, pay_date, bill_id=None, group_bank=None, group_variant=None):
+    """Modified to include an explicit Cancel/Abort button during the state machine flow."""
+    amount = 0.0
     
-    keyboard = [[InlineKeyboardButton(f"💰 Valor Integral (R$ {amount:.2f})", callback_data=f"payamt_full_{bill_id}")]]
-    text = f"💰 *Qual foi o valor exato pago?*\nValor integral da parcela: *R$ {amount:.2f}*\n\nSe houve desconto, *digite* o valor final pago (Ex: `150,50`).\nSe pagou o valor integral, clique no botão abaixo:"
+    if bill_id:
+        bills = get_pending_bills_by_month(target_month)
+        bill = next((b for b in bills if b['id'] == bill_id), None)
+        amount = bill['amount'] if bill else 0.0
+        callback_str = f"payamt_full_single_{bill_id}"
+    else:
+        bills = get_pending_bills_by_month(target_month)
+        for b in bills:
+            v_check = b['variant'] if b['variant'] else "none"
+            if b['bank'] == group_bank and v_check == group_variant:
+                amount += float(b['amount'])
+        callback_str = f"payamt_full_group_{group_bank}_{group_variant}_{target_month}"
+        
+    keyboard = [
+        [InlineKeyboardButton(f"💰 Valor Integral (R$ {amount:.2f})", callback_data=callback_str)],
+        [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]
+    ]
+    text = f"💰 *Qual foi o valor exato pago?*\nValor integral: *R$ {amount:.2f}*\n\nSe houve desconto, *digite* o valor final pago (Ex: `150,50`).\nSe pagou o valor integral, clique no botão abaixo:"
     
     if query:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -572,17 +645,27 @@ async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @security_check
 async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Router for all Telegram Inline Buttons (those attached beneath messages).
-    Parses the 'callback_data' string to understand user intent (Navigate, Pay, Cancel, Full Amount).
-    """
+    """Router for all Telegram Inline Buttons. Now handles Escape Hatches and Isolated Views."""
     query = update.callback_query
     await query.answer() 
     data = query.data
 
-    if data.startswith("mes_"):
-        target_month = data.split("_")[1]
-        await show_bills_month(update, context, target_month)
+    if data == "close_panel":
+        context.user_data.clear()
+        await query.edit_message_text("✅ Painel fechado.", parse_mode="Markdown")
+        return
+        
+    elif data == "cancel_fsm":
+        context.user_data.clear()
+        await query.edit_message_text("🛑 Ação cancelada. Você pode enviar novos recibos normalmente.", parse_mode="Markdown")
+        return
+
+    elif data.startswith("mes_"):
+        parts = data.split("_")
+        target_month = parts[1]
+        # Check if we are in isolated mode (e.g., 'mes_04/2026_tx_123')
+        filter_tx_id = int(parts[3]) if len(parts) > 3 and parts[2] == "tx" else None
+        await show_bills_month(update, context, target_month, filter_tx_id=filter_tx_id)
 
     elif data.startswith("fatura_"):
         parts = data.split("_")
@@ -592,7 +675,27 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         text = f"⚙️ *Gerenciar Parcela*\nO que você deseja fazer com esta fatura?"
         keyboard = [
             [InlineKeyboardButton("💸 Pagar / Antecipar", callback_data=f"pagar_{bill_id}_{target_month}")],
-            [InlineKeyboardButton("🗑️ Cancelar (Ignorar Parcela)", callback_data=f"cancelar_{bill_id}_{target_month}")],
+            [InlineKeyboardButton("🗑️ Cancelar (Ignorar Parcela)", callback_data=f"cancelar_{bill_id}_{target_month}")]
+        ]
+        
+        max_month, tx_id = get_max_month_for_transaction(int(bill_id))
+        if max_month and max_month != target_month and datetime.strptime(max_month, "%m/%Y") > datetime.strptime(target_month, "%m/%Y"):
+            keyboard.append([InlineKeyboardButton(f"⏭️ Pular para Última Parcela ({max_month})", callback_data=f"mes_{max_month}_tx_{tx_id}")])
+            
+        keyboard.append([InlineKeyboardButton("⬅️ Voltar", callback_data=f"mes_{target_month}")])
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+    elif data.startswith("fatgroup_"):
+        parts = data.split("_")
+        bank = parts[1]
+        variant = parts[2]
+        target_month = parts[3]
+        
+        v_tag = f" {variant}" if variant != "none" else ""
+        text = f"⚙️ *Gerenciar Fatura {bank}{v_tag}*\nO que você deseja fazer com a fatura integral deste mês?"
+        
+        keyboard = [
+            [InlineKeyboardButton("💸 Pagar Fatura Fechada", callback_data=f"paygroup_{bank}_{variant}_{target_month}")],
             [InlineKeyboardButton("⬅️ Voltar", callback_data=f"mes_{target_month}")]
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
@@ -605,26 +708,65 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
         context.user_data["parcela_pagamento_id"] = bill_id
         context.user_data["parcela_target_month"] = target_month
+        context.user_data["is_group_payment"] = False
         
-        keyboard = [[InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_{bill_id}")]]
+        keyboard = [
+            [InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_{bill_id}")],
+            [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]
+        ]
         await query.edit_message_text("📅 *Qual a data do pagamento?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    elif data.startswith("paygroup_"):
+        parts = data.split("_")
+        bank = parts[1]
+        variant = parts[2]
+        target_month = parts[3]
+        
+        context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
+        context.user_data["parcela_target_month"] = target_month
+        context.user_data["is_group_payment"] = True
+        context.user_data["group_bank"] = bank
+        context.user_data["group_variant"] = variant if variant != "none" else None
+        
+        keyboard = [
+            [InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_group")],
+            [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]
+        ]
+        await query.edit_message_text("📅 *Qual a data do pagamento da fatura?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
     elif data.startswith("paydate_hoje_"):
-        bill_id = int(data.split("_")[2])
         target_month = context.user_data.get("parcela_target_month")
         pay_date = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y")
-        
         context.user_data["parcela_pagamento_data"] = pay_date
         context.user_data["estado"] = "WAITING_FOR_PAYMENT_AMOUNT"
         
-        await ask_for_payment_amount(context.bot, update.effective_chat.id, query, bill_id, target_month, pay_date)
+        if context.user_data.get("is_group_payment"):
+            bank = context.user_data.get("group_bank")
+            variant = context.user_data.get("group_variant")
+            await ask_for_payment_amount(context.bot, update.effective_chat.id, query, target_month, pay_date, group_bank=bank, group_variant=variant)
+        else:
+            bill_id = context.user_data.get("parcela_pagamento_id")
+            await ask_for_payment_amount(context.bot, update.effective_chat.id, query, target_month, pay_date, bill_id=bill_id)
 
-    elif data.startswith("payamt_full_"):
-        bill_id = int(data.split("_")[2])
+    elif data.startswith("payamt_full_single_"):
+        bill_id = int(data.split("_")[3])
         pay_date = context.user_data.get("parcela_pagamento_data")
         
         if pay_bill_in_db(bill_id, pay_date, None): 
             await query.edit_message_text(f"✅ *Conta baixada com sucesso em {pay_date}!*", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("❌ Erro ao atualizar no banco de dados.", parse_mode="Markdown")
+        context.user_data.clear()
+        
+    elif data.startswith("payamt_full_group_"):
+        parts = data.split("_")
+        bank = parts[3]
+        variant = parts[4] if parts[4] != "none" else None
+        target_month = parts[5]
+        pay_date = context.user_data.get("parcela_pagamento_data")
+        
+        if pay_grouped_card_bills_in_db(target_month, bank, variant, pay_date, None):
+            await query.edit_message_text(f"✅ *Fatura inteira baixada com sucesso em {pay_date}!*", parse_mode="Markdown")
         else:
             await query.edit_message_text("❌ Erro ao atualizar no banco de dados.", parse_mode="Markdown")
         context.user_data.clear()
@@ -698,13 +840,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # FSM: Paying a Bill -> Custom Amount (Anticipation/Discount)
         if state == "WAITING_FOR_PAYMENT_AMOUNT":
             ans = update.message.text.lower().strip()
-            bill_id = context.user_data.get("parcela_pagamento_id")
             pay_date = context.user_data.get("parcela_pagamento_data")
+            is_group = context.user_data.get("is_group_payment", False)
 
             custom_amount = None
             if ans != "ok": 
                 try:
-                    # BR currency cleanup (R$ 1.500,50 -> 1500.50)
                     clean_val = ans.replace("r$", "").replace(" ", "")
                     if "," in clean_val and "." in clean_val: clean_val = clean_val.replace(".", "").replace(",", ".")
                     elif "," in clean_val: clean_val = clean_val.replace(",", ".")
@@ -713,8 +854,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("❌ Valor inválido. Digite apenas números (ex: `150,50`) ou clique no botão de valor integral.", parse_mode="Markdown")
                     return
 
-            if pay_bill_in_db(bill_id, pay_date, custom_amount): 
-                await update.message.reply_text(f"✅ *Conta baixada com sucesso em {pay_date}!*", parse_mode="Markdown")
+            success = False
+            if is_group:
+                bank = context.user_data.get("group_bank")
+                variant = context.user_data.get("group_variant")
+                target_month = context.user_data.get("parcela_target_month")
+                success = pay_grouped_card_bills_in_db(target_month, bank, variant, pay_date, custom_amount)
+            else:
+                bill_id = context.user_data.get("parcela_pagamento_id")
+                success = pay_bill_in_db(bill_id, pay_date, custom_amount)
+
+            if success: 
+                await update.message.reply_text(f"✅ *Baixado com sucesso em {pay_date}!*", parse_mode="Markdown")
             else: 
                 await update.message.reply_text("❌ Erro ao atualizar no banco de dados.")
             context.user_data.clear()
@@ -807,6 +958,73 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Olá! Mande seus gastos ou PDFs de contas para análise.")
 
+@security_check
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Renders the instruction manual for the user.
+    Accessible via the /help command.
+    """
+    help_text = (
+        "🤖 *Manual do Zotto — ERP Financeiro Pessoal*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "📥 *COMO LANÇAR TRANSAÇÕES*\n\n"
+        "Basta mandar uma mensagem — o Zotto entende tudo:\n\n"
+        "✏️ *Texto Livre*\n"
+        "_\"Padaria 18,50 no débito\"_\n"
+        "_\"Recebi salário de 3000\"_\n"
+        "_\"iPhone 12x no Nubank Ultravioleta\"_\n\n"
+        "🔗 *Link de NFC-e*\n"
+        "Cole o link do QR Code da nota fiscal direto no chat.\n\n"
+        "📄 *PDF*\n"
+        "Envie o arquivo da conta de luz, internet, fatura, etc.\n"
+        "⚠️ _PDFs com senha (faturas de celular) ainda não são suportados._\n\n"
+        "Após a análise, o Zotto envia um *resumo para você confirmar* antes de salvar.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚙️ *COMANDOS*\n\n"
+        "📋 /contas — Abre o painel de Contas a Pagar/Receber\n"
+        "🛑 /cancelar — Aborta qualquer ação em andamento e limpa a fila\n"
+        "❓ /help — Exibe este manual\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🗓️ *PAINEL DE CONTAS (/contas)*\n\n"
+        "🔴 *Vencida* — Parcela com data de vencimento no passado\n"
+        "🔹 *Pendente* — Parcela em aberto dentro do prazo\n"
+        "💳 *Fatura* — Total consolidado de um cartão de crédito no mês\n"
+        "   └ 🔸 Parcelas individuais dentro dessa fatura\n\n"
+        "🔲 *Navegação:*\n"
+        "⬅️ ➡️ Navega entre meses\n"
+        "⏭️ Salta direto ao mês mais distante com pendências\n"
+        "📅 Volta ao mês atual quando estiver navegando no calendário\n"
+        "❌ Fecha o painel\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💸 *COMO PAGAR*\n\n"
+        "📌 *Parcela avulsa:* Clique em qualquer item → *Pagar / Antecipar*\n"
+        "📌 *Fatura completa:* Clique no header 💳 → *Pagar Fatura Fechada*\n\n"
+        "O bot vai pedir a *data* e o *valor pago*:\n"
+        "• Clique em 📅 Hoje ou digite `DD/MM/AAAA`\n"
+        "• Clique em 💰 Valor Integral ou *digite um valor menor* se houve desconto\n\n"
+        "💡 *Antecipação com desconto:* Se você pagou menos que o valor original "
+        "(ex: negociou desconto à vista), o bot registra a diferença como desconto "
+        "na compra e ajusta o saldo automaticamente.\n\n"
+
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🔍 *RECURSOS AVANÇADOS*\n\n"
+        "🗑️ *Cancelar Parcela (Conciliação):*\n"
+        "Quando você lança a fatura do cartão como uma única transação do mês, "
+        "use esta opção para marcar individualmente as parcelas previstas como "
+        "ignoradas — sem apagar os meses futuros da mesma compra.\n\n"
+        "⏭️ *Última Parcela (Modo Isolado):*\n"
+        "Ao clicar em \"Pular para Última Parcela\" de uma compra parcelada, "
+        "o painel entra no *Modo Isolado* — exibe apenas as parcelas daquela "
+        "compra específica ao longo de todos os meses, ótimo para ver o saldo "
+        "restante de um financiamento ou compra longa.\n"
+        "Use *\"Voltar à Visão Geral\"* para sair do modo isolado.\n"
+    )
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
 # --- Application Entry Point ---
 if __name__ == '__main__':
     create_tables()
@@ -821,7 +1039,8 @@ if __name__ == '__main__':
     # Registers command routers
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("cancelar", cancel_command))
-    app.add_handler(CommandHandler("contas", list_pending_bills)) 
+    app.add_handler(CommandHandler("contas", list_pending_bills))
+    app.add_handler(CommandHandler("help", help_command))
     
     # Registers payload routers
     app.add_handler(CallbackQueryHandler(handle_inline_button)) 

@@ -463,17 +463,7 @@ def check_similar_transaction(location, amount, t_date_str):
 def get_pending_bills_by_month(month_year):
     """
     Core function for the Telegram '/contas' command.
-    
-    Uses an SQL 'JOIN' to combine data from 'installments' (amount, date) and 
-    'transactions' (location, card bank). 
-    Also calculates a real-time boolean flag (is_overdue) on the database side
-    by checking if 'due_date < CURRENT_DATE'.
-
-    Args:
-        month_year (str): The target month to filter (e.g., '04/2026').
-
-    Returns:
-        list: A list of dictionaries containing formatted bill information.
+    Includes the 'transaction_id' so we can isolate specific bills in the UI.
     """
     if not db_pool: return []
     conn = None
@@ -482,13 +472,15 @@ def get_pending_bills_by_month(month_year):
         cursor = conn.cursor()
         cursor.execute("""
             SELECT i.id, t.location_name, to_char(i.due_date, 'DD/MM/YYYY'), i.amount, 
-                   t.card_bank, t.card_variant, (i.due_date < CURRENT_DATE) as is_overdue
+                   t.card_bank, t.card_variant, (i.due_date < CURRENT_DATE) as is_overdue,
+                   t.id as transaction_id
             FROM installments i JOIN transactions t ON i.transaction_id = t.id
             WHERE i.month = %s AND i.payment_status = 'PENDING' ORDER BY i.due_date ASC
         """, (month_year,))
         return [{
             "id": r[0], "location": r[1], "due_date": r[2], "amount": float(r[3]),
-            "bank": r[4], "variant": r[5], "is_overdue": bool(r[6])
+            "bank": r[4], "variant": r[5], "is_overdue": bool(r[6]),
+            "transaction_id": r[7]
         } for r in cursor.fetchall()]
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
@@ -635,6 +627,129 @@ def reschedule_queue_item_busy(item_id, wait_seconds):
         conn.commit()
     except Exception as e:
         print(f"[DB ERROR] reschedule_busy: {e}")
+    finally:
+        if 'cursor' in locals() and cursor: cursor.close()
+        if conn: db_pool.putconn(conn)
+
+
+def get_max_pending_month():
+    """
+    Finds the absolute furthest month in the future that contains a pending bill.
+    Used for the 'Fast-Forward' (⏭️) button in the AP UI.
+    """
+    if not db_pool: return None
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        # PostgreSQL trick: Convert MM/YYYY string to a real date to find the max properly
+        cursor.execute("""
+            SELECT MAX(TO_DATE(month, 'MM/YYYY')) 
+            FROM installments 
+            WHERE payment_status = 'PENDING'
+        """)
+        max_date = cursor.fetchone()[0]
+        return max_date.strftime("%m/%Y") if max_date else None
+    except Exception as e:
+        print(f"[DB ERROR] get_max_pending_month: {e}")
+        return None
+    finally:
+        if 'cursor' in locals() and cursor: cursor.close()
+        if conn: db_pool.putconn(conn)
+
+def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, custom_paid_amount=None):
+    """
+    Pays ALL installments for a specific credit card in a specific month at once.
+    Calculates anticipation/discount proportionally if custom_paid_amount is provided.
+    """
+    if not db_pool: return False
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        pay_date = parse_br_date(payment_date_str)
+        
+        # 1. Get all pending installments for this card/month
+        cursor.execute("""
+            SELECT i.id, i.amount, i.transaction_id 
+            FROM installments i 
+            JOIN transactions t ON i.transaction_id = t.id
+            WHERE i.month = %s AND i.payment_status = 'PENDING' 
+              AND t.card_bank = %s AND COALESCE(t.card_variant, '') = %s
+        """, (month_year, bank, variant if variant else ''))
+        
+        installments = cursor.fetchall()
+        if not installments: return False
+        
+        total_original_amount = sum(float(row[1]) for row in installments)
+        final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else total_original_amount
+        total_discount = total_original_amount - final_paid_amount
+        
+        # If there's a discount, we distribute it proportionally across all items to keep accounting balanced
+        discount_ratio = total_discount / total_original_amount if total_original_amount > 0 else 0
+
+        for inst_id, original_amt, trans_id in installments:
+            item_discount = float(original_amt) * discount_ratio
+            item_paid = float(original_amt) - item_discount
+            
+            # Update specific installment
+            cursor.execute("""
+                UPDATE installments 
+                SET payment_status = 'PAID', payment_date = %s, paid_amount = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (pay_date, item_paid, inst_id))
+            
+            # Update parent transaction with proportional discount
+            if item_discount != 0.0:
+                cursor.execute("""
+                    UPDATE transactions 
+                    SET discount_applied = COALESCE(discount_applied, 0) + %s,
+                        total_amount = total_amount - %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                """, (item_discount, item_discount, trans_id))
+                
+            # Check if parent transaction is fully paid
+            cursor.execute("SELECT count(*) FROM installments WHERE transaction_id = %s AND payment_status = 'PENDING'", (trans_id,))
+            if cursor.fetchone()[0] == 0:
+                cursor.execute("UPDATE transactions SET status = 'Paga', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (trans_id,))
+                
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"[DB ERROR] pay_grouped_card_bills: {e}")
+        if conn: conn.rollback()
+        return False
+    finally:
+        if 'cursor' in locals() and cursor: cursor.close()
+        if conn: db_pool.putconn(conn)
+
+def get_max_month_for_transaction(installment_id):
+    """
+    Finds the absolute last month (due date) for a specific transaction.
+    Returns both the month and the transaction_id to build the Isolated View.
+    """
+    if not db_pool: return None, None
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT transaction_id FROM installments WHERE id = %s", (installment_id,))
+        row = cursor.fetchone()
+        if not row: return None, None
+        transaction_id = row[0]
+        
+        cursor.execute("""
+            SELECT MAX(TO_DATE(month, 'MM/YYYY')) 
+            FROM installments 
+            WHERE transaction_id = %s AND payment_status = 'PENDING'
+        """, (transaction_id,))
+        max_date = cursor.fetchone()[0]
+        return (max_date.strftime("%m/%Y"), transaction_id) if max_date else (None, None)
+    except Exception as e:
+        print(f"[DB ERROR] get_max_month_for_transaction: {e}")
+        return None, None
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
