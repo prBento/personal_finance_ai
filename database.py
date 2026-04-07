@@ -520,10 +520,11 @@ def calculate_invoice_due_date_db(action_date, closing_day, due_day):
         base_month += relativedelta(months=1)
     return base_month + relativedelta(day=due_day)
 
-def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
+def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None, new_method=None, new_bank=None, new_variant=None):
     """
     Motor Avançado de Pagamento e Antecipação (Regime de Caixa).
     Diferencia antecipação de contas à vista vs cartões de crédito.
+    Agora permite sobrescrever o método de pagamento no ato da baixa.
     """
     if not db_pool: return False, "Erro de Conexão."
     conn = None
@@ -545,6 +546,17 @@ def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
         if not row: return False, "Parcela não encontrada."
         
         original_amount, trans_id, inst_month, inst_due, bank, variant, method = row
+        
+        # --- NOVO BLOCO: ATUALIZA MÉTODO DE PAGAMENTO SE FORNECIDO ---
+        if new_method:
+            method = new_method
+            bank = new_bank
+            variant = new_variant
+            cursor.execute("""
+                UPDATE transactions 
+                SET payment_method = %s, card_bank = %s, card_variant = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (method, bank, variant, trans_id))
         
         final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else float(original_amount)
         discount = float(original_amount) - final_paid_amount
