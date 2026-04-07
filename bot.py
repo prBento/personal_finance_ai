@@ -20,7 +20,8 @@ from database import (
     create_tables, save_transactions_to_db, get_card_from_db, save_card_to_db, list_cards_from_db, 
     add_to_queue, get_next_in_queue, reschedule_queue_item, reschedule_queue_item_busy, complete_queue_item, check_existing_invoice,
     check_similar_transaction, cancel_queue_items, get_pending_bills_by_month, pay_bill_in_db,
-    get_all_overdue_installments, cancel_installment, get_max_pending_month, pay_grouped_card_bills_in_db, get_max_month_for_transaction
+    get_all_overdue_installments, cancel_installment, get_max_pending_month, pay_grouped_card_bills_in_db, get_max_month_for_transaction,
+    get_cash_flow_by_month
 )
 
 # --- Environment & Configuration ---
@@ -58,7 +59,7 @@ ESTRUTURA DE SAÍDA OBRIGATÓRIA (Apenas JSON):
     "numero_nota": "Número da nota ou null",
     "serie_nota": "Série ou null",
     "valor_total_bruto": 0.00,
-    "desconto_total": 0.00,
+    "desconto_total": "PROCURE POR DESCONTOS ou FAÇA (VALOR TOTAL DOS PRODUTOS - VALOR DA NOTA) ou 0,00",
     "valor_total": 0.00,
     "metodo_pagamento": "Dinheiro, Cartão de Crédito, Cartão de Débito, Pix, Boleto, Conta Corrente, Financiamento ou null",
     "quantidade_parcelas": 1,
@@ -95,6 +96,7 @@ MAPA DE CATEGORIAS (RECEITAS):
 - Entradas > Salário | Rendimentos | Aluguel | Reembolso | Vendas | Cashback | Outros
 
 REGRAS DE DESAMBIGUAÇÃO (CRÍTICAS — Aplique ANTES de classificar):
+- 🚨 Notas Fiscais (NF-e, NFC-e, DANFE), cupons e recibos de lojas (ex: Petlove, Mercado Livre) são SEMPRE gastos. Portanto o `tipo_transacao` é obrigatoriamente "DESPESA" e a categoria JAMAIS será "Entradas" (ignore se o texto da nota disser "valor recebido", pois foi a loja que recebeu o seu dinheiro).
 - "Total Pass", "Gympass", "Smart Fit", "Bluefit" e similares são ACADEMIAS → sempre "Saúde e Beleza > Academias". NUNCA classifique como Transporte ou Lazer.
 - "Uber", "99", "inDriver", "Cabify" → "Transporte > App de Transporte". NUNCA como Lazer ou Viagem.
 - "Netflix", "Spotify", "Disney+", "Amazon Prime", "Max" → "Serviços > Assinaturas". NUNCA como Lazer.
@@ -207,7 +209,7 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     cash_keywords = ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança", "benefício", "pré-pago"]
     is_cash_payment = any(word in method_str for word in cash_keywords)
     
-    payment_status = "PAID" if (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str else "PENDING"
+    payment_status = "PAID" if (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str else "PENDING"
     date_paid = tx_date.strftime("%d/%m/%Y") if payment_status == "PAID" else None
     paid_value = installment_value if payment_status == "PAID" else 0.0
 
@@ -287,12 +289,29 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                 if check_similar_transaction(loc_check, float(tx.get("valor_total") or 0.0), tx.get("dt_transacao") or today_str):
                     tx["alerta_duplicidade"] = True
 
-            # Fixes zeroes
+            # --- CODE-FORCED MATH & DISCOUNT FALLBACK ---
             val_total = float(tx.get("valor_total") or 0.0)
-            if val_total == 0.0 and tx.get("itens"):
-                val_total = sum(float(i.get("valor_unitario", 0)) * float(i.get("quantidade", 1)) for i in tx["itens"])
-                tx["valor_total"] = round(val_total, 2)
+            
+            # 1. Calculates the true gross total directly from the items
+            sum_items = round(sum(float(i.get("valor_unitario", 0)) * float(i.get("quantidade", 1)) for i in tx.get("itens", [])), 2)
+            
+            # 2. Fixes zeroed totals
+            if val_total == 0.0 and sum_items > 0:
+                val_total = sum_items
+                tx["valor_total"] = val_total
                 
+            # 3. Hidden Discount Detector
+            # If the mathematical sum of the items is greater than the total invoice value, 
+            # we have a discount that the LLM missed.
+            if sum_items > val_total > 0:
+                calc_discount = round(sum_items - val_total, 2)
+                current_discount = float(tx.get("desconto_aplicado") or 0.0)
+                
+                # Overwrites LLM hallucination with hard code math
+                if calc_discount > current_discount:
+                    tx["valor_original"] = sum_items
+                    tx["desconto_aplicado"] = calc_discount
+                    
             if not tx.get("dt_transacao") or tx.get("dt_transacao") == "null": tx["dt_transacao"] = today_str
             
             for idx, it in enumerate(tx.get("itens", []), start=1):
@@ -396,19 +415,18 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     tx_date = tx.get("dt_transacao", datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y"))
 
     # Whitelists prevent the LLM from inventing fake payment methods
-    trusted_methods = ["pix", "dinheiro", "conta", "poupança", "crédito", "credito", "débito", "debito", "cartão", "cartao", "benefício", "financiamento", "boleto", "aberta"]
+    trusted_methods = ["pix", "dinheiro", "conta", "poupança", "crédito", "credito", "débito", "debito", "cartão", "cartao", "benefício", "financiamento", "boleto", "aberta", "aberto", "pendente"]
     is_method_trusted = any(tm in method for tm in trusted_methods)
     is_missing_loc = str(loc_name).strip().lower() in clean_words or "desconhecido" in str(loc_name).strip().lower()
 
     if current_state != "AGUARDANDO_CONFIRMACAO":
-        # Step 1: Validate Payment Method
         if user_data.get("is_pdf") or method in clean_words or not is_method_trusted:
             user_data["estado"] = "AGUARDANDO_METODO_PAGAMENTO"
             if tx_type == "RECEITA":
-                keyboard = ReplyKeyboardMarkup([["Pix", "Conta Corrente/Poupança"], ["Dinheiro", "Cartão de Benefício"]], resize_keyboard=True, one_time_keyboard=True)
-                await bot.send_message(chat_id, f"📄 Recebimento de *{loc_name}* (R$ {tx_val:.2f})\nOnde esse valor entrou?", reply_markup=keyboard, parse_mode="Markdown")
+                keyboard = ReplyKeyboardMarkup([["Pix", "Conta Corrente/Poupança"], ["Dinheiro", "⏳ Ainda não recebi (Previsto)"]], resize_keyboard=True, one_time_keyboard=True)
+                await bot.send_message(chat_id, f"📄 Recebimento de *{loc_name}* (R$ {tx_val:.2f})\nOnde esse valor entrará?", reply_markup=keyboard, parse_mode="Markdown")
             else:
-                keyboard = ReplyKeyboardMarkup([["Cartão de Crédito", "Cartão de Débito"], ["Pix", "Dinheiro"], ["Financiamento", "⏳ Ainda não paguei (Aberto)"]], resize_keyboard=True, one_time_keyboard=True)
+                keyboard = ReplyKeyboardMarkup([["Cartão de Crédito", "Cartão de Débito"], ["Pix", "Dinheiro", "Boleto"], ["Financiamento", "⏳ Ainda não paguei (Aberto)"]], resize_keyboard=True, one_time_keyboard=True)
                 await bot.send_message(chat_id, f"📄 Compra em *{loc_name}* (R$ {tx_val:.2f})\nComo você pagou?", reply_markup=keyboard, parse_mode="Markdown")
             return
 
@@ -470,7 +488,17 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     parcels = int(tx.get("quantidade_parcelas") or 1)
     
     summary = f"📈 *Resumo*\n🏢 *Origem:* {loc_name}\n📅 *Data:* {tx_date}\n" if tx_type == "RECEITA" else f"🛒 *Resumo*\n📍 *Local:* {loc_name}\n📅 *Data:* {tx_date}\n"
-    summary += f"🏷️ *Categoria:* {cat}\n💰 *Valor:* R$ {float(tx.get('valor_total') or 0):.2f}\n💳 *Método:* {tx.get('metodo_pagamento')}"
+    summary += f"🏷️ *Categoria:* {cat}\n"
+    
+    discount_app = float(tx.get('desconto_aplicado') or 0.0)
+    if discount_app > 0:
+        summary += f"💰 *Valor Bruto:* R$ {float(tx.get('valor_original') or 0):.2f}\n"
+        summary += f"✂️ *Desconto:* -R$ {discount_app:.2f}\n"
+        summary += f"💵 *Valor Final:* R$ {float(tx.get('valor_total') or 0):.2f}\n"
+    else:
+        summary += f"💰 *Valor:* R$ {float(tx.get('valor_total') or 0):.2f}\n"
+        
+    summary += f"💳 *Método:* {tx.get('metodo_pagamento')}"
     summary += f" ({bank} {variant})\n" if bank else "\n"
     
     if tx_type != "RECEITA": summary += f"📅 *Parcelas:* {parcels}x\n\n"
@@ -517,9 +545,8 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str, filter_tx_id: int = None):
     """
     Renders the interactive AP Dashboard.
-    If 'filter_tx_id' is provided, it enters "Isolated View", showing ONLY the installments
-    belonging to that specific transaction, hiding everything else in that month.
-    Includes 'Fast-Forward' and 'Return to Current Month' navigation.
+    If 'filter_tx_id' is provided, it enters "Isolated View".
+    Visually differentiates Incomes (Receitas) from Expenses (Despesas).
     """
     bills = get_pending_bills_by_month(target_month)
     
@@ -531,16 +558,16 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     else:
         overdue_all = get_all_overdue_installments()
         overdue_other = [b for b in overdue_all if b['month'] != target_month]
-        text = f"🗓️ *Contas Pendentes - {target_month}*\n"
+        text = f"🗓️ *Painel de Pendências - {target_month}*\n"
         if overdue_other:
-            text += f"\n🚨 *ATENÇÃO:* Você tem {len(overdue_other)} contas *VENCIDAS* em outros meses!\n"
+            text += f"\n🚨 *ATENÇÃO:* Você tem {len(overdue_other)} pendências *VENCIDAS* em outros meses!\n"
 
     keyboard = []
     if not bills:
-        text += "\n🎉 Nenhuma parcela pendente aqui!"
+        text += "\n🎉 Nenhuma pendência para este mês!"
     else:
         if not filter_tx_id:
-            text += "\nSelecione uma conta ou fatura para gerenciar:\n"
+            text += "\nSelecione um item para gerenciar:\n"
         
         grouped_cards = {}
         standalone_bills = []
@@ -559,7 +586,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             else:
                 standalone_bills.append(b)
                 
-        # Render Grouped Cards
+        # Render Grouped Cards (Credit cards are always expenses)
         for key, card in grouped_cards.items():
             icon = "🔴" if card['is_overdue'] else "💳"
             v_tag = f" {card['variant']}" if card['variant'] else ""
@@ -574,10 +601,18 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 child_text = f"   └ {item_icon} {item['location'][:12]} - R$ {item['amount']:.2f}"
                 keyboard.append([InlineKeyboardButton(child_text, callback_data=f"fatura_{item['id']}_{target_month}")])
 
-        # Render Standalone Bills
+        # Render Standalone Bills (Can be Income or Expense)
         for b in standalone_bills:
-            icon = "🔴" if b['is_overdue'] else "🔹"
-            btn_text = f"{icon} {b['location'][:15]} - R$ {b['amount']:.2f} ({b['due_date'][:5]})"
+            is_income = b.get('type', 'DESPESA') == 'RECEITA'
+            
+            if is_income:
+                icon = "🟡" if b['is_overdue'] else "🟢"
+                sign = "+"
+            else:
+                icon = "🔴" if b['is_overdue'] else "🔹"
+                sign = ""
+                
+            btn_text = f"{icon} {b['location'][:14]} {sign}R$ {b['amount']:.2f} ({b['due_date'][:5]})"
             keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"fatura_{b['id']}_{target_month}")])
 
     target_dt = datetime.strptime(target_month, "%m/%Y")
@@ -617,15 +652,19 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 async def ask_for_payment_amount(bot, chat_id, query, target_month, pay_date, bill_id=None, group_bank=None, group_variant=None):
-    """Modified to include an explicit Cancel/Abort button during the state machine flow."""
+    """Modified to include dynamic text based on Transaction Type (Income vs Expense)."""
     amount = 0.0
+    is_income = False
     
     if bill_id:
         bills = get_pending_bills_by_month(target_month)
-        bill = next((b for b in bills if b['id'] == bill_id), None)
+        bill = next((b for b in bills if str(b['id']) == str(bill_id)), None)
         amount = bill['amount'] if bill else 0.0
+        if bill and bill.get('type', 'DESPESA') == 'RECEITA':
+            is_income = True
         callback_str = f"payamt_full_single_{bill_id}"
     else:
+        # Grouped cards are always expenses
         bills = get_pending_bills_by_month(target_month)
         for b in bills:
             v_check = b['variant'] if b['variant'] else "none"
@@ -637,12 +676,137 @@ async def ask_for_payment_amount(bot, chat_id, query, target_month, pay_date, bi
         [InlineKeyboardButton(f"💰 Valor Integral (R$ {amount:.2f})", callback_data=callback_str)],
         [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]
     ]
-    text = f"💰 *Qual foi o valor exato pago?*\nValor integral: *R$ {amount:.2f}*\n\nSe houve desconto, *digite* o valor final pago (Ex: `150,50`).\nSe pagou o valor integral, clique no botão abaixo:"
+    
+    # Dynamic wording based on transaction type
+    action_word = "recebido" if is_income else "pago"
+    
+    text = f"💰 *Qual foi o valor exato {action_word}?*\nValor integral: *R$ {amount:.2f}*\n\nSe houve diferença, *digite* o valor final {action_word} (Ex: `150,50`).\nSe {action_word} o valor integral, clique no botão abaixo:"
     
     if query:
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
     else:
         await bot.send_message(chat_id, text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+
+# --- (CASH FLOW) ---
+async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str):
+    """
+    Renders the Financial Ledger (Extrato) on Telegram.
+    Now includes dynamic installment tracking (e.g., 8/10) embedded in the monospaced layout.
+    """
+    transactions = get_cash_flow_by_month(target_month)
+    
+    def fmt_money(val):
+        return f"{val:,.2f}".replace(',', 'v').replace('.', ',').replace('v', '.')
+    
+    main_tx = []
+    ben_tx = []
+    
+    for t in transactions:
+        m = t['method'].lower()
+        if "benefício" in m or "beneficio" in m or "pré-pago" in m or "pre-pago" in m or "vr" in m or "va" in m:
+            ben_tx.append(t)
+        else:
+            main_tx.append(t)
+
+    rec_pagas = sum(t['paid_amount'] for t in main_tx if t['type'] == 'RECEITA' and t['status'] == 'PAID')
+    rec_prev = sum(t['expected_amount'] for t in main_tx if t['type'] == 'RECEITA' and t['status'] == 'PENDING')
+    desp_pagas = sum(t['paid_amount'] for t in main_tx if t['type'] == 'DESPESA' and t['status'] == 'PAID')
+    desp_prev = sum(t['expected_amount'] for t in main_tx if t['type'] == 'DESPESA' and t['status'] == 'PENDING')
+    
+    saldo_atual = rec_pagas - desp_pagas
+    saldo_projetado = (rec_pagas + rec_prev) - (desp_pagas + desp_prev)
+
+    ben_rec_pagas = sum(t['paid_amount'] for t in ben_tx if t['type'] == 'RECEITA' and t['status'] == 'PAID')
+    ben_desp_pagas = sum(t['paid_amount'] for t in ben_tx if t['type'] == 'DESPESA' and t['status'] == 'PAID')
+    ben_saldo_atual = ben_rec_pagas - ben_desp_pagas
+
+    text = f"📊 *Extrato — {target_month}*\n\n"
+    
+    text += f"💰 *Saldo Atual:* R$ {fmt_money(saldo_atual)}\n"
+    text += f"📈 *Projetado:* R$ {fmt_money(saldo_projetado)}\n"
+    
+    if ben_tx:
+        text += f"\n🎫 *Saldo Benefício:* R$ {fmt_money(ben_saldo_atual)}\n"
+
+    text += "\n─────────────────\n"
+    text += f"💵 *Receitas*\n"
+    text += f"  Realizado: R$ {fmt_money(rec_pagas)}\n"
+    text += f"  Previsto:  R$ {fmt_money(rec_prev)}\n\n"
+    
+    text += f"💸 *Despesas*\n"
+    text += f"  Realizado: R$ {fmt_money(desp_pagas)}\n"
+    text += f"  Previsto:  R$ {fmt_money(desp_prev)}\n"
+    
+    text += "─────────────────\n"
+    text += "📋 *Últimos Lançamentos*\n"
+    
+    if not transactions:
+        text += "_Nenhuma movimentação neste mês._"
+    else:
+        text += "```text\n"
+        
+        for t in transactions[:30]:
+            is_income = t['type'] == 'RECEITA'
+            is_paid = t['status'] == 'PAID'
+            
+            date_str = t['payment_date'][:5] if is_paid and t['payment_date'] else t['due_date'][:5]
+            amount_val = t['paid_amount'] if is_paid else t['expected_amount']
+            
+            amt_formatted = fmt_money(amount_val)
+            amt_str = f"{amt_formatted}" if is_income else f"({amt_formatted})"
+            
+            # --- INSTALLMENT STRING BUILDER ---
+            loc_raw = t['location'].strip().title()
+            if t.get('is_installment') and t.get('installment_count', 1) > 1:
+                parcel_str = f" {t['inst_num']}/{t['installment_count']}"
+                # Calcula o espaço restante para o nome do local não estourar a linha
+                max_loc_len = max(0, 14 - len(parcel_str))
+                loc = f"{loc_raw[:max_loc_len]}{parcel_str}"
+            else:
+                loc = loc_raw[:14]
+            
+            tag = " " if is_paid else "*"
+            
+            # Formatação alinhada: Local (14), Data (5), Valor (10)
+            line = f"{loc:<14} {date_str} - {amt_str:>10} {tag}"
+            
+            text += line + "\n"
+
+        text += "```\n"
+
+        if len(transactions) > 30:
+            text += f"_...e mais {len(transactions) - 30} transações._\n"
+            
+        text += "_( * ) = Lançamento Previsto/Pendente_\n"
+
+    target_dt = datetime.strptime(target_month, "%m/%Y")
+    prev_month = (target_dt - relativedelta(months=1)).strftime("%m/%Y")
+    next_month = (target_dt + relativedelta(months=1)).strftime("%m/%Y")
+
+    nav_row = [
+        InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"extmes_{prev_month}"),
+        InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"extmes_{next_month}")
+    ]
+    
+    keyboard = [nav_row]
+    
+    current_month_str = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
+    if target_month != current_month_str:
+        keyboard.append([InlineKeyboardButton(f"📅 Voltar para Mês Atual", callback_data=f"extmes_{current_month_str}")])
+        
+    keyboard.append([InlineKeyboardButton("❌ Fechar Extrato", callback_data="close_panel")])
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+@security_check
+async def extrato_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point for the /extrato command."""
+    current_month = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
+    await show_cash_flow_month(update, context, current_month)
 
 @security_check
 async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -652,7 +816,7 @@ async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 @security_check
 async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Router for all Telegram Inline Buttons. Now handles Escape Hatches and Isolated Views."""
+    """Router for all Telegram Inline Buttons. Adapted for dynamic Income/Expense text."""
     query = update.callback_query
     await query.answer() 
     data = query.data
@@ -666,11 +830,107 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.clear()
         await query.edit_message_text("🛑 Ação cancelada. Você pode enviar novos recibos normalmente.", parse_mode="Markdown")
         return
+    
+    elif data == "help_main":
+        await help_command(update, context)
+        return
+
+    elif data.startswith("help_"):
+        topic = data.split("_")[1]
+        
+        if topic == "lancamentos":
+            text = (
+                "📥 *COMO LANÇAR TRANSAÇÕES*\n\n"
+                "Basta mandar uma mensagem — o Zotto entende tudo:\n\n"
+                "✏️ *Texto Livre*\n"
+                "_\"Padaria 18,50 no débito\"_\n"
+                "_\"Recebi salário de 3000\"_\n"
+                "_\"iPhone 12x no Nubank Ultravioleta\"_\n\n"
+                "🔗 *Link de NFC-e*\n"
+                "Cole o link do QR Code da nota fiscal direto no chat.\n\n"
+                "📄 *PDF*\n"
+                "Envie o arquivo da conta de luz, internet, fatura, etc.\n"
+                "⚠️ _PDFs com senha (faturas de celular) ainda não são suportados._\n\n"
+                "Após a análise, o Zotto envia um *resumo para você confirmar* antes de salvar."
+            )
+        elif topic == "painel":
+            text = (
+                "🗓️ *PAINEL DE CONTAS (/contas)*\n\n"
+                "🔴 *Vencida* — Parcela com data de vencimento no passado\n"
+                "🔹 *Pendente* — Parcela em aberto dentro do prazo\n"
+                "💳 *Fatura* — Total consolidado de um cartão de crédito no mês\n"
+                "   └ 🔸 Parcelas individuais dentro dessa fatura\n\n"
+                "🔲 *Navegação:*\n"
+                "⬅️ ➡️ Navega entre meses\n"
+                "⏭️ Salta direto ao mês mais distante com pendências\n"
+                "📅 Volta ao mês atual quando estiver navegando no calendário"
+            )
+        elif topic == "extrato":
+            text = (
+                "📊 *PAINEL DE EXTRATO (/extrato)*\n\n"
+                "Sua visão gerencial e fluxo de caixa do mês.\n\n"
+                "💰 *Saldos:*\n"
+                "• *Atual:* Dinheiro líquido disponível hoje (Receitas Realizadas - Despesas Realizadas).\n"
+                "• *Projetado:* Como terminará o mês após receber/pagar tudo que está previsto.\n"
+                "• *Benefício:* Saldo isolado de VR/VA (não se mistura com o dinheiro líquido).\n\n"
+                "🔲 *Legenda de Lançamentos:*\n"
+                "▫️ Receita Realizada (Entrou na conta)\n"
+                "▪️ Despesa Realizada (Saiu da conta)\n"
+                "◽️ Receita Prevista (Salário a receber)\n"
+                "🔶 Despesa Prevista (Conta a pagar)\n"
+            )
+        elif topic == "pagamentos":
+            text = (
+                "💸 *COMO PAGAR / BAIXAR*\n\n"
+                "📌 *Parcela avulsa:* Clique em qualquer item → *Pagar / Antecipar*\n"
+                "📌 *Fatura completa:* Clique no header 💳 → *Pagar Fatura Fechada*\n\n"
+                "O bot vai pedir a *data* e o *valor pago*:\n"
+                "• Clique em 📅 Hoje ou digite `DD/MM/AAAA`\n"
+                "• Clique em 💰 Valor Integral ou *digite um valor menor* se houve desconto\n\n"
+                "💡 *Antecipação com desconto:* Se você pagou menos que o valor original "
+                "(ex: negociou desconto à vista), o bot registra a diferença como desconto "
+                "na compra e ajusta o saldo automaticamente."
+            )
+        elif topic == "avancado":
+            text = (
+                "🔍 *RECURSOS AVANÇADOS*\n\n"
+                "🗑️ *Cancelar Parcela (Conciliação):*\n"
+                "Quando você lança a fatura do cartão como uma única transação do mês, "
+                "use esta opção para marcar individualmente as parcelas previstas como "
+                "ignoradas — sem apagar os meses futuros da mesma compra.\n\n"
+                "⏭️ *Última Parcela (Modo Isolado):*\n"
+                "Ao clicar em \"Pular para Última Parcela\" de uma compra parcelada, "
+                "o painel entra no *Modo Isolado* — exibe apenas as parcelas daquela "
+                "compra específica ao longo de todos os meses, ótimo para ver o saldo "
+                "restante de um financiamento ou compra longa.\n"
+                "Use *\"Voltar à Visão Geral\"* para sair do modo isolado."
+            )
+        elif topic == "cancelar":
+            text = (
+                "🛑 *BOTÃO DE EMERGÊNCIA (/cancelar)*\n\n"
+                "Use este comando em duas situações:\n\n"
+                "1️⃣ *Preso em uma pergunta:*\n"
+                "Se o bot perguntar algo (ex: _Qual a data?_) e você desistir da ação ou digitar errado, mande `/cancelar` para ele esquecer tudo e voltar ao estado normal.\n\n"
+                "2️⃣ *Limpar a Fila de IA:*\n"
+                "Se você enviou várias notas e a IA entrou em espera por limite de uso (Rate Limit), digitar `/cancelar` limpa todas as suas notas pendentes que estão na fila do banco de dados."
+            )    
+            
+        # Botões universais para retornar ou fechar
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="help_main")],
+            [InlineKeyboardButton("❌ Fechar Ajuda", callback_data="close_panel")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
+
+    elif data.startswith("extmes_"):
+        parts = data.split("_")
+        target_month = parts[1]
+        await show_cash_flow_month(update, context, target_month)
 
     elif data.startswith("mes_"):
         parts = data.split("_")
         target_month = parts[1]
-        # Check if we are in isolated mode (e.g., 'mes_04/2026_tx_123')
         filter_tx_id = int(parts[3]) if len(parts) > 3 and parts[2] == "tx" else None
         await show_bills_month(update, context, target_month, filter_tx_id=filter_tx_id)
 
@@ -679,10 +939,19 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill_id = parts[1]
         target_month = parts[2]
         
-        text = f"⚙️ *Gerenciar Parcela*\nO que você deseja fazer com esta fatura?"
+        # Check if income or expense to adapt UI
+        bills = get_pending_bills_by_month(target_month)
+        bill = next((b for b in bills if str(b['id']) == bill_id), None)
+        is_income = bill and bill.get('type', 'DESPESA') == 'RECEITA'
+
+        title_text = "⚙️ *Gerenciar Recebimento*" if is_income else "⚙️ *Gerenciar Parcela*"
+        action_text = "💸 Confirmar Recebimento" if is_income else "💸 Pagar / Antecipar"
+        cancel_text = "🗑️ Cancelar (Ignorar Entrada)" if is_income else "🗑️ Cancelar (Ignorar Parcela)"
+
+        text = f"{title_text}\nO que você deseja fazer com este item?"
         keyboard = [
-            [InlineKeyboardButton("💸 Pagar / Antecipar", callback_data=f"pagar_{bill_id}_{target_month}")],
-            [InlineKeyboardButton("🗑️ Cancelar (Ignorar Parcela)", callback_data=f"cancelar_{bill_id}_{target_month}")]
+            [InlineKeyboardButton(action_text, callback_data=f"pagar_{bill_id}_{target_month}")],
+            [InlineKeyboardButton(cancel_text, callback_data=f"cancelar_{bill_id}_{target_month}")]
         ]
         
         max_month, tx_id = get_max_month_for_transaction(int(bill_id))
@@ -712,6 +981,11 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill_id = int(parts[1])
         target_month = parts[2]
         
+        # Check if income
+        bills = get_pending_bills_by_month(target_month)
+        bill = next((b for b in bills if str(b['id']) == str(bill_id)), None)
+        is_income = bill and bill.get('type', 'DESPESA') == 'RECEITA'
+        
         context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
         context.user_data["parcela_pagamento_id"] = bill_id
         context.user_data["parcela_target_month"] = target_month
@@ -721,7 +995,9 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_{bill_id}")],
             [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]
         ]
-        await query.edit_message_text("📅 *Qual a data do pagamento?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        
+        question_text = "📅 *Qual a data do recebimento?*" if is_income else "📅 *Qual a data do pagamento?*"
+        await query.edit_message_text(f"{question_text}\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
     elif data.startswith("paygroup_"):
         parts = data.split("_")
@@ -759,10 +1035,11 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill_id = int(data.split("_")[3])
         pay_date = context.user_data.get("parcela_pagamento_data")
         
-        if pay_bill_in_db(bill_id, pay_date, None): 
-            await query.edit_message_text(f"✅ *Conta baixada com sucesso em {pay_date}!*", parse_mode="Markdown")
+        success, msg = pay_bill_in_db(bill_id, pay_date, None)
+        if success: 
+            await query.edit_message_text(msg, parse_mode="Markdown")
         else:
-            await query.edit_message_text("❌ Erro ao atualizar no banco de dados.", parse_mode="Markdown")
+            await query.edit_message_text(f"❌ {msg}", parse_mode="Markdown")
         context.user_data.clear()
         
     elif data.startswith("payamt_full_group_"):
@@ -772,10 +1049,11 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         target_month = parts[5]
         pay_date = context.user_data.get("parcela_pagamento_data")
         
-        if pay_grouped_card_bills_in_db(target_month, bank, variant, pay_date, None):
-            await query.edit_message_text(f"✅ *Fatura inteira baixada com sucesso em {pay_date}!*", parse_mode="Markdown")
+        success, msg = pay_grouped_card_bills_in_db(target_month, bank, variant, pay_date, None)
+        if success:
+            await query.edit_message_text(msg, parse_mode="Markdown")
         else:
-            await query.edit_message_text("❌ Erro ao atualizar no banco de dados.", parse_mode="Markdown")
+            await query.edit_message_text(f"❌ {msg}", parse_mode="Markdown")
         context.user_data.clear()
 
     elif data.startswith("cancelar_"):
@@ -783,7 +1061,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill_id = int(parts[1])
         target_month = parts[2]
         if cancel_installment(bill_id):
-            await query.edit_message_text("✅ *Parcela ignorada/cancelada com sucesso!*\n(Isso não apaga as outras parcelas da compra original).", parse_mode="Markdown")
+            await query.edit_message_text("✅ *Registro ignorado/cancelado com sucesso!*\n(Isso não apaga outras parcelas originais).", parse_mode="Markdown")
             await asyncio.sleep(2)
             await show_bills_month(update, context, target_month)
 
@@ -862,19 +1140,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
             success = False
+            msg = ""
             if is_group:
                 bank = context.user_data.get("group_bank")
                 variant = context.user_data.get("group_variant")
                 target_month = context.user_data.get("parcela_target_month")
-                success = pay_grouped_card_bills_in_db(target_month, bank, variant, pay_date, custom_amount)
+                success, msg = pay_grouped_card_bills_in_db(target_month, bank, variant, pay_date, custom_amount)
             else:
                 bill_id = context.user_data.get("parcela_pagamento_id")
-                success = pay_bill_in_db(bill_id, pay_date, custom_amount)
+                success, msg = pay_bill_in_db(bill_id, pay_date, custom_amount)
 
             if success: 
-                await update.message.reply_text(f"✅ *Baixado com sucesso em {pay_date}!*", parse_mode="Markdown")
+                await update.message.reply_text(msg, parse_mode="Markdown")
             else: 
-                await update.message.reply_text("❌ Erro ao atualizar no banco de dados.")
+                await update.message.reply_text(f"❌ {msg}", parse_mode="Markdown")
             context.user_data.clear()
             return
 
@@ -882,9 +1161,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state == "AGUARDANDO_METODO_PAGAMENTO":
             choice = update.message.text
             t = context.user_data["transacao_pendente_json"]["transacoes"][0]
-            if "aberto" in choice.lower() or "não paguei" in choice.lower(): t["metodo_pagamento"] = "Fatura Aberta/Boleto"
-            else: t["metodo_pagamento"] = choice
+            choice_lower = choice.lower()
+            
+            if "aberto" in choice_lower or "não paguei" in choice_lower or "não recebi" in choice_lower: 
+                t["metodo_pagamento"] = "Pendente/Aberto"
+            else: 
+                t["metodo_pagamento"] = choice
+                
             context.user_data["estado"] = None
+            context.user_data["is_pdf"] = False
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
@@ -971,66 +1256,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Renders the instruction manual for the user.
     Accessible via the /help command.
     """
-    help_text = (
+
+    text = (
         "🤖 *Manual do Zotto — ERP Financeiro Pessoal*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "📥 *COMO LANÇAR TRANSAÇÕES*\n\n"
-        "Basta mandar uma mensagem — o Zotto entende tudo:\n\n"
-        "✏️ *Texto Livre*\n"
-        "_\"Padaria 18,50 no débito\"_\n"
-        "_\"Recebi salário de 3000\"_\n"
-        "_\"iPhone 12x no Nubank Ultravioleta\"_\n\n"
-        "🔗 *Link de NFC-e*\n"
-        "Cole o link do QR Code da nota fiscal direto no chat.\n\n"
-        "📄 *PDF*\n"
-        "Envie o arquivo da conta de luz, internet, fatura, etc.\n"
-        "⚠️ _PDFs com senha (faturas de celular) ainda não são suportados._\n\n"
-        "Após a análise, o Zotto envia um *resumo para você confirmar* antes de salvar.\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚙️ *COMANDOS*\n\n"
-        "📋 /contas — Abre o painel de Contas a Pagar/Receber\n"
-        "🛑 /cancelar — Aborta qualquer ação em andamento e limpa a fila\n"
-        "❓ /help — Exibe este manual\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🗓️ *PAINEL DE CONTAS (/contas)*\n\n"
-        "🔴 *Vencida* — Parcela com data de vencimento no passado\n"
-        "🔹 *Pendente* — Parcela em aberto dentro do prazo\n"
-        "💳 *Fatura* — Total consolidado de um cartão de crédito no mês\n"
-        "   └ 🔸 Parcelas individuais dentro dessa fatura\n\n"
-        "🔲 *Navegação:*\n"
-        "⬅️ ➡️ Navega entre meses\n"
-        "⏭️ Salta direto ao mês mais distante com pendências\n"
-        "📅 Volta ao mês atual quando estiver navegando no calendário\n"
-        "❌ Fecha o painel\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💸 *COMO PAGAR*\n\n"
-        "📌 *Parcela avulsa:* Clique em qualquer item → *Pagar / Antecipar*\n"
-        "📌 *Fatura completa:* Clique no header 💳 → *Pagar Fatura Fechada*\n\n"
-        "O bot vai pedir a *data* e o *valor pago*:\n"
-        "• Clique em 📅 Hoje ou digite `DD/MM/AAAA`\n"
-        "• Clique em 💰 Valor Integral ou *digite um valor menor* se houve desconto\n\n"
-        "💡 *Antecipação com desconto:* Se você pagou menos que o valor original "
-        "(ex: negociou desconto à vista), o bot registra a diferença como desconto "
-        "na compra e ajusta o saldo automaticamente.\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔍 *RECURSOS AVANÇADOS*\n\n"
-        "🗑️ *Cancelar Parcela (Conciliação):*\n"
-        "Quando você lança a fatura do cartão como uma única transação do mês, "
-        "use esta opção para marcar individualmente as parcelas previstas como "
-        "ignoradas — sem apagar os meses futuros da mesma compra.\n\n"
-        "⏭️ *Última Parcela (Modo Isolado):*\n"
-        "Ao clicar em \"Pular para Última Parcela\" de uma compra parcelada, "
-        "o painel entra no *Modo Isolado* — exibe apenas as parcelas daquela "
-        "compra específica ao longo de todos os meses, ótimo para ver o saldo "
-        "restante de um financiamento ou compra longa.\n"
-        "Use *\"Voltar à Visão Geral\"* para sair do modo isolado.\n"
+        "Bem-vindo à central de ajuda!\n"
+        "Escolha um tópico abaixo para ver os detalhes:"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    
+    keyboard = [
+        [InlineKeyboardButton("📥 Como lançar transações", callback_data="help_lancamentos")],
+        [InlineKeyboardButton("🗓️ Painel de Contas (/contas)", callback_data="help_painel")],
+        [InlineKeyboardButton("📊 Painel de Extrato (/extrato)", callback_data="help_extrato")],
+        [InlineKeyboardButton("💸 Como Pagar / Baixar", callback_data="help_pagamentos")],
+        [InlineKeyboardButton("🔍 Recursos Avançados", callback_data="help_avancado")],
+        [InlineKeyboardButton("🛑 Cancelar Ações (/cancelar)", callback_data="help_cancelar")],
+        [InlineKeyboardButton("❌ Fechar Ajuda", callback_data="close_panel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Verifica se foi chamado pelo comando /help ou pelo botão "Voltar"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 # --- Application Entry Point ---
 if __name__ == '__main__':
@@ -1047,6 +1296,7 @@ if __name__ == '__main__':
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("cancelar", cancel_command))
     app.add_handler(CommandHandler("contas", list_pending_bills))
+    app.add_handler(CommandHandler("extrato", extrato_command))
     app.add_handler(CommandHandler("help", help_command))
     
     # Registers payload routers

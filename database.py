@@ -3,6 +3,7 @@ import psycopg2
 from psycopg2 import pool
 from datetime import datetime
 from dotenv import load_dotenv
+from dateutil.relativedelta import relativedelta
 
 # Loads environment variables from the .env file (like DATABASE_URL)
 load_dotenv()
@@ -463,7 +464,8 @@ def check_similar_transaction(location, amount, t_date_str):
 def get_pending_bills_by_month(month_year):
     """
     Core function for the Telegram '/contas' command.
-    Includes the 'transaction_id' so we can isolate specific bills in the UI.
+    Includes the 'transaction_id' and 'transaction_type' to isolate specific bills 
+    and visually differentiate Incomes from Expenses.
     """
     if not db_pool: return []
     conn = None
@@ -473,14 +475,14 @@ def get_pending_bills_by_month(month_year):
         cursor.execute("""
             SELECT i.id, t.location_name, to_char(i.due_date, 'DD/MM/YYYY'), i.amount, 
                    t.card_bank, t.card_variant, (i.due_date < CURRENT_DATE) as is_overdue,
-                   t.id as transaction_id
+                   t.id as transaction_id, t.transaction_type
             FROM installments i JOIN transactions t ON i.transaction_id = t.id
             WHERE i.month = %s AND i.payment_status = 'PENDING' ORDER BY i.due_date ASC
         """, (month_year,))
         return [{
             "id": r[0], "location": r[1], "due_date": r[2], "amount": float(r[3]),
             "bank": r[4], "variant": r[5], "is_overdue": bool(r[6]),
-            "transaction_id": r[7]
+            "transaction_id": r[7], "type": r[8]
         } for r in cursor.fetchall()]
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
@@ -508,49 +510,95 @@ def get_all_overdue_installments():
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
 
+def calculate_invoice_due_date_db(action_date, closing_day, due_day):
+    """Calcula a data da fatura alvo baseada no dia da antecipação."""
+    if closing_day == 0 and due_day == 0: return action_date
+    base_month = action_date.replace(day=1)
+    if action_date.day >= closing_day:
+        base_month += relativedelta(months=1)
+    if due_day < closing_day:
+        base_month += relativedelta(months=1)
+    return base_month + relativedelta(day=due_day)
+
 def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
     """
-    Marks a bill as paid and handles Anticipation Discounts.
-
-    If the user pays less than the original installment amount, the system:
-    1. Calculates the discount (Original - Paid = Discount).
-    2. Registers the exact paid amount in the installment row.
-    3. Subtracts the discount from the parent 'transactions' total_amount, 
-       keeping the financial audit perfectly balanced.
-
-    Args:
-        installment_id (int): ID of the installment being paid.
-        payment_date_str (str): Date the payment occurred.
-        custom_paid_amount (float, optional): The exact money spent.
-
-    Returns:
-        bool: True if transaction committed successfully.
+    Motor Avançado de Pagamento e Antecipação (Regime de Caixa).
+    Diferencia antecipação de contas à vista vs cartões de crédito.
     """
-    if not db_pool: return False
+    if not db_pool: return False, "Erro de Conexão."
     conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
         pay_date = parse_br_date(payment_date_str)
+        pay_month_str = pay_date.strftime("%m/%Y")
         
-        # 1. Grab original amount to calculate mathematical difference
-        cursor.execute("SELECT amount, transaction_id FROM installments WHERE id = %s", (installment_id,))
+        # 1. Pega os dados completos da parcela e transação pai
+        cursor.execute("""
+            SELECT i.amount, i.transaction_id, i.month, i.due_date,
+                   t.card_bank, t.card_variant, t.payment_method
+            FROM installments i
+            JOIN transactions t ON i.transaction_id = t.id
+            WHERE i.id = %s
+        """, (installment_id,))
         row = cursor.fetchone()
-        if not row: return False
-        original_amount, transaction_id = row
+        if not row: return False, "Parcela não encontrada."
         
-        # 2. Calculate the discount yield
+        original_amount, trans_id, inst_month, inst_due, bank, variant, method = row
+        
         final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else float(original_amount)
         discount = float(original_amount) - final_paid_amount
 
-        # 3. Update the specific installment
+        # Verifica se é um pagamento envolvendo cartão de crédito
+        is_credit_card = bank and ("crédito" in str(method).lower() or "credito" in str(method).lower())
+        
+        if is_credit_card:
+            # Busca as regras de fechamento do cartão
+            cursor.execute("SELECT closing_day, due_day FROM credit_cards WHERE bank ILIKE %s AND COALESCE(variant, '') ILIKE %s LIMIT 1", (bank, variant or ''))
+            card_rules = cursor.fetchone()
+            closing = int(card_rules[0]) if card_rules else 0
+            due = int(card_rules[1]) if card_rules else 0
+            
+            # Descobre qual é a "Fatura Aberta Atual" baseada no dia da antecipação
+            new_due_date = calculate_invoice_due_date_db(pay_date, closing, due)
+            
+            # Se a fatura atual é antes do vencimento original, caracteriza ANTECIPAÇÃO NO CARTÃO
+            if new_due_date < inst_due:
+                new_month_str = new_due_date.strftime("%m/%Y")
+                
+                # Move a parcela para o mês da fatura alvo, reduz o valor (desconto), mas MANTÉM PENDENTE!
+                cursor.execute("""
+                    UPDATE installments
+                    SET due_date = %s,
+                        month = %s,
+                        amount = %s,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                """, (new_due_date, new_month_str, final_paid_amount, installment_id))
+                
+                # Ajusta o balanço da transação original
+                if discount != 0.0:
+                    cursor.execute("""
+                        UPDATE transactions 
+                        SET discount_applied = COALESCE(discount_applied, 0) + %s,
+                            total_amount = total_amount - %s,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                    """, (discount, discount, trans_id))
+                
+                conn.commit()
+                return True, f"⚠️ *Conta antecipada!* Ela foi movida para a fatura de *{new_month_str}* (Ficará pendente até você pagar o cartão)."
+
+        # SE NÃO FOR CARTÃO (ou se for cartão pago em atraso/na data correta): Pagamento Realizado
         cursor.execute("""
             UPDATE installments 
-            SET payment_status = 'PAID', payment_date = %s, paid_amount = %s, updated_at = CURRENT_TIMESTAMP
+            SET payment_status = 'PAID', payment_date = %s, paid_amount = %s, 
+                month = %s, -- REALOCA para o mês de pagamento para refletir no Extrato!
+                updated_at = CURRENT_TIMESTAMP
             WHERE id = %s
-        """, (pay_date, final_paid_amount, installment_id))
+        """, (pay_date, final_paid_amount, pay_month_str, installment_id))
         
-        # 4. If a discount occurred, adjust the parent transaction to maintain accounting integrity
+        # Ajusta descontos
         if discount != 0.0:
             cursor.execute("""
                 UPDATE transactions 
@@ -558,20 +606,19 @@ def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
                     total_amount = total_amount - %s,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
-            """, (discount, discount, transaction_id))
-        
-        # 5. Cascading Status: If this was the last pending installment, mark the parent as 'PAID'
-        cursor.execute("SELECT count(*) FROM installments WHERE transaction_id = %s AND payment_status = 'PENDING'", (transaction_id,))
-        pending_count = cursor.fetchone()[0]
-        if pending_count == 0:
-            cursor.execute("UPDATE transactions SET status = 'PAID', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (transaction_id,))
+            """, (discount, discount, trans_id))
+            
+        # Cascata de Pai Pago
+        cursor.execute("SELECT count(*) FROM installments WHERE transaction_id = %s AND payment_status = 'PENDING'", (trans_id,))
+        if cursor.fetchone()[0] == 0:
+            cursor.execute("UPDATE transactions SET status = 'PAID', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (trans_id,))
             
         conn.commit()
-        return True
+        return True, f"✅ Baixado com sucesso em {payment_date_str}!"
     except Exception as e:
         print(f"[DB ERROR] pay_bill: {e}")
         if conn: conn.rollback()
-        return False
+        return False, "Erro ao gravar no banco de dados."
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
@@ -659,17 +706,16 @@ def get_max_pending_month():
 
 def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, custom_paid_amount=None):
     """
-    Pays ALL installments for a specific credit card in a specific month at once.
-    Calculates anticipation/discount proportionally if custom_paid_amount is provided.
+    Paga todas as faturas do cartão e realoca os meses das parcelas para o mês de pagamento (Caixa).
     """
-    if not db_pool: return False
+    if not db_pool: return False, "Erro de conexão."
     conn = None
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor()
         pay_date = parse_br_date(payment_date_str)
+        pay_month_str = pay_date.strftime("%m/%Y")
         
-        # 1. Get all pending installments for this card/month
         cursor.execute("""
             SELECT i.id, i.amount, i.transaction_id 
             FROM installments i 
@@ -679,27 +725,25 @@ def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, cu
         """, (month_year, bank, variant if variant else ''))
         
         installments = cursor.fetchall()
-        if not installments: return False
+        if not installments: return False, "Nenhuma fatura pendente encontrada."
         
         total_original_amount = sum(float(row[1]) for row in installments)
         final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else total_original_amount
         total_discount = total_original_amount - final_paid_amount
-        
-        # If there's a discount, we distribute it proportionally across all items to keep accounting balanced
         discount_ratio = total_discount / total_original_amount if total_original_amount > 0 else 0
 
         for inst_id, original_amt, trans_id in installments:
             item_discount = float(original_amt) * discount_ratio
             item_paid = float(original_amt) - item_discount
             
-            # Update specific installment
             cursor.execute("""
                 UPDATE installments 
-                SET payment_status = 'PAID', payment_date = %s, paid_amount = %s, updated_at = CURRENT_TIMESTAMP
+                SET payment_status = 'PAID', payment_date = %s, paid_amount = %s, 
+                    month = %s, -- Alinha com o Regime de Caixa para o Extrato
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = %s
-            """, (pay_date, item_paid, inst_id))
+            """, (pay_date, item_paid, pay_month_str, inst_id))
             
-            # Update parent transaction with proportional discount
             if item_discount != 0.0:
                 cursor.execute("""
                     UPDATE transactions 
@@ -709,17 +753,16 @@ def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, cu
                     WHERE id = %s
                 """, (item_discount, item_discount, trans_id))
                 
-            # Check if parent transaction is fully paid
             cursor.execute("SELECT count(*) FROM installments WHERE transaction_id = %s AND payment_status = 'PENDING'", (trans_id,))
             if cursor.fetchone()[0] == 0:
-                cursor.execute("UPDATE transactions SET status = 'Paga', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (trans_id,))
+                cursor.execute("UPDATE transactions SET status = 'PAID', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (trans_id,))
                 
         conn.commit()
-        return True
+        return True, f"✅ Fatura inteira baixada com sucesso em {payment_date_str}!"
     except Exception as e:
         print(f"[DB ERROR] pay_grouped_card_bills: {e}")
         if conn: conn.rollback()
-        return False
+        return False, "Erro ao gravar no banco."
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
@@ -750,6 +793,55 @@ def get_max_month_for_transaction(installment_id):
     except Exception as e:
         print(f"[DB ERROR] get_max_month_for_transaction: {e}")
         return None, None
+    finally:
+        if 'cursor' in locals() and cursor: cursor.close()
+        if conn: db_pool.putconn(conn)
+
+def get_cash_flow_by_month(month_year):
+    """
+    Fetches the complete Cash Flow statement for a specific month.
+    Uses a CTE with ROW_NUMBER() to dynamically calculate the original 
+    installment index (e.g., 8 of 10) regardless of due date changes.
+    """
+    if not db_pool: return []
+    conn = None
+    try:
+        conn = db_pool.getconn()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            WITH InstNums AS (
+                SELECT id, ROW_NUMBER() OVER(PARTITION BY transaction_id ORDER BY id ASC) as inst_num
+                FROM installments
+            )
+            SELECT i.id, t.location_name, to_char(i.due_date, 'DD/MM/YYYY'), 
+                   to_char(i.payment_date, 'DD/MM/YYYY'), i.amount, i.paid_amount, 
+                   t.transaction_type, i.payment_status, t.payment_method,
+                   t.is_installment, t.installment_count, n.inst_num
+            FROM installments i 
+            JOIN transactions t ON i.transaction_id = t.id
+            JOIN InstNums n ON i.id = n.id
+            WHERE i.month = %s AND i.payment_status != 'CANCELED'
+            ORDER BY i.due_date ASC
+        """, (month_year,))
+        
+        return [{
+            "id": r[0], 
+            "location": r[1], 
+            "due_date": r[2], 
+            "payment_date": r[3],
+            "expected_amount": float(r[4]), 
+            "paid_amount": float(r[5] or 0),
+            "type": r[6], 
+            "status": r[7],
+            "method": str(r[8] or ""),
+            "is_installment": bool(r[9]),
+            "installment_count": int(r[10] or 1),
+            "inst_num": int(r[11] or 1)
+        } for r in cursor.fetchall()]
+    except Exception as e:
+        print(f"[DB ERROR] get_cash_flow_by_month: {e}")
+        return []
     finally:
         if 'cursor' in locals() and cursor: cursor.close()
         if conn: db_pool.putconn(conn)
