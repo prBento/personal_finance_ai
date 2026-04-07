@@ -381,7 +381,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                         f"Assim que processado, envio o resumo para você confirmar.",
                         parse_mode="Markdown"
                     )
-            # Standard RPM/TPM check -> Extracts wait time from error log
+            # Standard RPM/TPM check -> Extracts wait time from error log 
             else:
                 match = re.search(r'try again in (?:(\d+)h)?(?:(\d+)m)?(?:([\d.]+)s)?', error_msg)
                 if match:
