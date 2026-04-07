@@ -924,12 +924,15 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
                 "💸 *COMO PAGAR / BAIXAR*\n\n"
                 "📌 *Parcela avulsa:* Clique em qualquer item → *Pagar / Antecipar*\n"
                 "📌 *Fatura completa:* Clique no header 💳 → *Pagar Fatura Fechada*\n\n"
-                "O bot vai pedir a *data* e o *valor pago*:\n"
-                "• Clique em 📅 Hoje ou digite `DD/MM/AAAA`\n"
-                "• Clique em 💰 Valor Integral ou *digite um valor menor* se houve desconto\n\n"
-                "💡 *Antecipação com desconto:* Se você pagou menos que o valor original "
-                "(ex: negociou desconto à vista), o bot registra a diferença como desconto "
-                "na compra e ajusta o saldo automaticamente."
+                "O bot pedirá a *data*, o *método* e o *valor pago*:\n"
+                "• Clique em 📅 Hoje ou digite a data (`DD/MM/AAAA`)\n"
+                "• Confirme de onde o dinheiro saiu\n"
+                "• Clique em Valor Integral ou digite um menor (desconto)\n\n"
+                "💡 *PRO-TIP: Boleto Futuro pago no Passado*\n"
+                "Pagou um boleto de Maio *ontem*, mas enviou o PDF só hoje? Se você marcar como pago na hora, o Zotto assumirá a data de *hoje*. Para o registro contábil perfeito:\n\n"
+                "1️⃣ *Lance como Previsto:* Envie o PDF e clique em *⏳ Ainda não paguei (Aberto)*. Ele salva no mês do vencimento.\n"
+                "2️⃣ *Dê a baixa manual:* Abra o `/contas`, vá até o mês do vencimento e clique em *Pagar/Antecipar*.\n"
+                "3️⃣ *Controle Absoluto:* Quando pedir a data, ignore o botão 'Hoje' e *digite a data de ontem* (Ex: `06/04/2026`). O Zotto puxará a conta pro extrato no dia exato!"
             )
         elif topic == "avancado":
             text = (
