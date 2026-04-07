@@ -830,6 +830,98 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.clear()
         await query.edit_message_text("🛑 Ação cancelada. Você pode enviar novos recibos normalmente.", parse_mode="Markdown")
         return
+    
+    elif data == "help_main":
+        await help_command(update, context)
+        return
+
+    elif data.startswith("help_"):
+        topic = data.split("_")[1]
+        
+        if topic == "lancamentos":
+            text = (
+                "📥 *COMO LANÇAR TRANSAÇÕES*\n\n"
+                "Basta mandar uma mensagem — o Zotto entende tudo:\n\n"
+                "✏️ *Texto Livre*\n"
+                "_\"Padaria 18,50 no débito\"_\n"
+                "_\"Recebi salário de 3000\"_\n"
+                "_\"iPhone 12x no Nubank Ultravioleta\"_\n\n"
+                "🔗 *Link de NFC-e*\n"
+                "Cole o link do QR Code da nota fiscal direto no chat.\n\n"
+                "📄 *PDF*\n"
+                "Envie o arquivo da conta de luz, internet, fatura, etc.\n"
+                "⚠️ _PDFs com senha (faturas de celular) ainda não são suportados._\n\n"
+                "Após a análise, o Zotto envia um *resumo para você confirmar* antes de salvar."
+            )
+        elif topic == "painel":
+            text = (
+                "🗓️ *PAINEL DE CONTAS (/contas)*\n\n"
+                "🔴 *Vencida* — Parcela com data de vencimento no passado\n"
+                "🔹 *Pendente* — Parcela em aberto dentro do prazo\n"
+                "💳 *Fatura* — Total consolidado de um cartão de crédito no mês\n"
+                "   └ 🔸 Parcelas individuais dentro dessa fatura\n\n"
+                "🔲 *Navegação:*\n"
+                "⬅️ ➡️ Navega entre meses\n"
+                "⏭️ Salta direto ao mês mais distante com pendências\n"
+                "📅 Volta ao mês atual quando estiver navegando no calendário"
+            )
+        elif topic == "extrato":
+            text = (
+                "📊 *PAINEL DE EXTRATO (/extrato)*\n\n"
+                "Sua visão gerencial e fluxo de caixa do mês.\n\n"
+                "💰 *Saldos:*\n"
+                "• *Atual:* Dinheiro líquido disponível hoje (Receitas Realizadas - Despesas Realizadas).\n"
+                "• *Projetado:* Como terminará o mês após receber/pagar tudo que está previsto.\n"
+                "• *Benefício:* Saldo isolado de VR/VA (não se mistura com o dinheiro líquido).\n\n"
+                "🔲 *Legenda de Lançamentos:*\n"
+                "▫️ Receita Realizada (Entrou na conta)\n"
+                "▪️ Despesa Realizada (Saiu da conta)\n"
+                "◽️ Receita Prevista (Salário a receber)\n"
+                "🔶 Despesa Prevista (Conta a pagar)\n"
+            )
+        elif topic == "pagamentos":
+            text = (
+                "💸 *COMO PAGAR / BAIXAR*\n\n"
+                "📌 *Parcela avulsa:* Clique em qualquer item → *Pagar / Antecipar*\n"
+                "📌 *Fatura completa:* Clique no header 💳 → *Pagar Fatura Fechada*\n\n"
+                "O bot vai pedir a *data* e o *valor pago*:\n"
+                "• Clique em 📅 Hoje ou digite `DD/MM/AAAA`\n"
+                "• Clique em 💰 Valor Integral ou *digite um valor menor* se houve desconto\n\n"
+                "💡 *Antecipação com desconto:* Se você pagou menos que o valor original "
+                "(ex: negociou desconto à vista), o bot registra a diferença como desconto "
+                "na compra e ajusta o saldo automaticamente."
+            )
+        elif topic == "avancado":
+            text = (
+                "🔍 *RECURSOS AVANÇADOS*\n\n"
+                "🗑️ *Cancelar Parcela (Conciliação):*\n"
+                "Quando você lança a fatura do cartão como uma única transação do mês, "
+                "use esta opção para marcar individualmente as parcelas previstas como "
+                "ignoradas — sem apagar os meses futuros da mesma compra.\n\n"
+                "⏭️ *Última Parcela (Modo Isolado):*\n"
+                "Ao clicar em \"Pular para Última Parcela\" de uma compra parcelada, "
+                "o painel entra no *Modo Isolado* — exibe apenas as parcelas daquela "
+                "compra específica ao longo de todos os meses, ótimo para ver o saldo "
+                "restante de um financiamento ou compra longa.\n"
+                "Use *\"Voltar à Visão Geral\"* para sair do modo isolado."
+            )
+        elif topic == "cancelar":
+            text = (
+                "🛑 *BOTÃO DE EMERGÊNCIA (/cancelar)*\n\n"
+                "Use este comando em duas situações:\n\n"
+                "1️⃣ *Preso em uma pergunta:*\n"
+                "Se o bot perguntar algo (ex: _Qual a data?_) e você desistir da ação ou digitar errado, mande `/cancelar` para ele esquecer tudo e voltar ao estado normal.\n\n"
+                "2️⃣ *Limpar a Fila de IA:*\n"
+                "Se você enviou várias notas e a IA entrou em espera por limite de uso (Rate Limit), digitar `/cancelar` limpa todas as suas notas pendentes que estão na fila do banco de dados."
+            )    
+            
+        # Botões universais para retornar ou fechar
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="help_main")],
+            [InlineKeyboardButton("❌ Fechar Ajuda", callback_data="close_panel")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return
 
     elif data.startswith("extmes_"):
         parts = data.split("_")
@@ -1164,66 +1256,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Renders the instruction manual for the user.
     Accessible via the /help command.
     """
-    help_text = (
+
+    text = (
         "🤖 *Manual do Zotto — ERP Financeiro Pessoal*\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-        "📥 *COMO LANÇAR TRANSAÇÕES*\n\n"
-        "Basta mandar uma mensagem — o Zotto entende tudo:\n\n"
-        "✏️ *Texto Livre*\n"
-        "_\"Padaria 18,50 no débito\"_\n"
-        "_\"Recebi salário de 3000\"_\n"
-        "_\"iPhone 12x no Nubank Ultravioleta\"_\n\n"
-        "🔗 *Link de NFC-e*\n"
-        "Cole o link do QR Code da nota fiscal direto no chat.\n\n"
-        "📄 *PDF*\n"
-        "Envie o arquivo da conta de luz, internet, fatura, etc.\n"
-        "⚠️ _PDFs com senha (faturas de celular) ainda não são suportados._\n\n"
-        "Após a análise, o Zotto envia um *resumo para você confirmar* antes de salvar.\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "⚙️ *COMANDOS*\n\n"
-        "📋 /contas — Abre o painel de Contas a Pagar/Receber\n"
-        "🛑 /cancelar — Aborta qualquer ação em andamento e limpa a fila\n"
-        "❓ /help — Exibe este manual\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🗓️ *PAINEL DE CONTAS (/contas)*\n\n"
-        "🔴 *Vencida* — Parcela com data de vencimento no passado\n"
-        "🔹 *Pendente* — Parcela em aberto dentro do prazo\n"
-        "💳 *Fatura* — Total consolidado de um cartão de crédito no mês\n"
-        "   └ 🔸 Parcelas individuais dentro dessa fatura\n\n"
-        "🔲 *Navegação:*\n"
-        "⬅️ ➡️ Navega entre meses\n"
-        "⏭️ Salta direto ao mês mais distante com pendências\n"
-        "📅 Volta ao mês atual quando estiver navegando no calendário\n"
-        "❌ Fecha o painel\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "💸 *COMO PAGAR*\n\n"
-        "📌 *Parcela avulsa:* Clique em qualquer item → *Pagar / Antecipar*\n"
-        "📌 *Fatura completa:* Clique no header 💳 → *Pagar Fatura Fechada*\n\n"
-        "O bot vai pedir a *data* e o *valor pago*:\n"
-        "• Clique em 📅 Hoje ou digite `DD/MM/AAAA`\n"
-        "• Clique em 💰 Valor Integral ou *digite um valor menor* se houve desconto\n\n"
-        "💡 *Antecipação com desconto:* Se você pagou menos que o valor original "
-        "(ex: negociou desconto à vista), o bot registra a diferença como desconto "
-        "na compra e ajusta o saldo automaticamente.\n\n"
-
-        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "🔍 *RECURSOS AVANÇADOS*\n\n"
-        "🗑️ *Cancelar Parcela (Conciliação):*\n"
-        "Quando você lança a fatura do cartão como uma única transação do mês, "
-        "use esta opção para marcar individualmente as parcelas previstas como "
-        "ignoradas — sem apagar os meses futuros da mesma compra.\n\n"
-        "⏭️ *Última Parcela (Modo Isolado):*\n"
-        "Ao clicar em \"Pular para Última Parcela\" de uma compra parcelada, "
-        "o painel entra no *Modo Isolado* — exibe apenas as parcelas daquela "
-        "compra específica ao longo de todos os meses, ótimo para ver o saldo "
-        "restante de um financiamento ou compra longa.\n"
-        "Use *\"Voltar à Visão Geral\"* para sair do modo isolado.\n"
+        "Bem-vindo à central de ajuda!\n"
+        "Escolha um tópico abaixo para ver os detalhes:"
     )
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    
+    keyboard = [
+        [InlineKeyboardButton("📥 Como lançar transações", callback_data="help_lancamentos")],
+        [InlineKeyboardButton("🗓️ Painel de Contas (/contas)", callback_data="help_painel")],
+        [InlineKeyboardButton("📊 Painel de Extrato (/extrato)", callback_data="help_extrato")],
+        [InlineKeyboardButton("💸 Como Pagar / Baixar", callback_data="help_pagamentos")],
+        [InlineKeyboardButton("🔍 Recursos Avançados", callback_data="help_avancado")],
+        [InlineKeyboardButton("🛑 Cancelar Ações (/cancelar)", callback_data="help_cancelar")],
+        [InlineKeyboardButton("❌ Fechar Ajuda", callback_data="close_panel")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Verifica se foi chamado pelo comando /help ou pelo botão "Voltar"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
 # --- Application Entry Point ---
 if __name__ == '__main__':
