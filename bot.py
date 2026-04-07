@@ -621,20 +621,33 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             else:
                 standalone_bills.append(b)
                 
+        expanded_groups = context.user_data.setdefault(f"expanded_{target_month}", {})
+        
         # Render Grouped Cards (Credit cards are always expenses)
         for key, card in grouped_cards.items():
-            icon = "🔴" if card['is_overdue'] else "💳"
+            is_expanded = expanded_groups.get(key, False) # Verifica se deve mostrar os filhos
+            
+            icon_alert = "🔴" if card['is_overdue'] else "💳"
+            toggle_icon = "⏷" if is_expanded else "⏵"
+            
             v_tag = f" {card['variant']}" if card['variant'] else ""
             display_name = f"{card['bank']}{v_tag}"
-            
             safe_var = card['variant'] if card['variant'] else "none"
-            parent_text = f"{icon} Fatura {display_name} - R$ {card['total_amount']:.2f}"
-            keyboard.append([InlineKeyboardButton(parent_text, callback_data=f"fatgroup_{card['bank']}_{safe_var}_{target_month}")])
             
-            for item in card['items']:
-                item_icon = "🔴" if item['is_overdue'] else "🔸"
-                child_text = f"   └ {item_icon} {item['location'][:12]} - R$ {item['amount']:.2f}"
-                keyboard.append([InlineKeyboardButton(child_text, callback_data=f"fatura_{item['id']}_{target_month}")])
+            # O botão principal agora serve para expandir/encolher (toggle)
+            parent_text = f"{toggle_icon} {icon_alert} {display_name} - R$ {card['total_amount']:.2f}"
+            keyboard.append([InlineKeyboardButton(parent_text, callback_data=f"toggle_{card['bank']}_{safe_var}_{target_month}")])
+            
+            # Só desenha os botões de baixo SE o acordeon estiver aberto
+            if is_expanded:
+                # O botão de pagar a fatura fechada fica aqui dentro como primeira opção
+                keyboard.append([InlineKeyboardButton("   💸 Pagar Fatura Fechada", callback_data=f"fatgroup_{card['bank']}_{safe_var}_{target_month}")])
+                
+                # Renderiza os itens individuais
+                for item in card['items']:
+                    item_icon = "🔴" if item['is_overdue'] else "🔸"
+                    child_text = f"   ↳ {item_icon} {item['location'][:12]} - R$ {item['amount']:.2f}"
+                    keyboard.append([InlineKeyboardButton(child_text, callback_data=f"fatura_{item['id']}_{target_month}")])
 
         # Render Standalone Bills (Can be Income or Expense)
         for b in standalone_bills:
@@ -870,6 +883,24 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data.clear()
         await query.edit_message_text("🛑 Ação cancelada. Você pode enviar novos recibos normalmente.", parse_mode="Markdown")
         return
+    
+    elif data.startswith("toggle_"):
+        parts = data.split("_")
+        bank = parts[1]
+        variant = parts[2]
+        target_month = parts[3]
+        
+        # Recria a chave do grupo
+        group_key = f"{bank}_{variant}" if variant != "none" else bank
+        
+        # Acessa a memória de acordeons deste mês
+        expanded_dict = context.user_data.setdefault(f"expanded_{target_month}", {})
+        
+        # Inverte o estado atual (Se True vira False, se False vira True)
+        expanded_dict[group_key] = not expanded_dict.get(group_key, False)
+        
+        # Chama a função para desenhar a tela novamente com o novo estado
+        await show_bills_month(update, context, target_month)
     
     elif data == "help_main":
         await help_command(update, context)
