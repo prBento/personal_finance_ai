@@ -189,8 +189,13 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     actual_installments = max(1, total_installments)
     installment_value = round(total_amount / actual_installments, 2)
     
-    try: tx_date = datetime.strptime(transaction_date_str, "%d/%m/%Y")
-    except: tx_date = datetime.now(timezone(timedelta(hours=-3)))
+    br_tz = timezone(timedelta(hours=-3))
+    today_dt = datetime.now(br_tz)
+    
+    try: 
+        tx_date = datetime.strptime(transaction_date_str, "%d/%m/%Y").replace(tzinfo=br_tz)
+    except: 
+        tx_date = today_dt
         
     closing = int(card_rules.get("closing", 0)) if card_rules else 0
     due = int(card_rules.get("due", 0)) if card_rules else 0
@@ -198,29 +203,50 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     
     # Determines the baseline date for the first installment
     if first_inst_date:
-        try: base_date = datetime.strptime(first_inst_date, "%d/%m/%Y")
-        except: base_date = tx_date
-    elif card_rules and closing == 0 and due == 0: base_date = tx_date
+        try: 
+            base_date = datetime.strptime(first_inst_date, "%d/%m/%Y").replace(tzinfo=br_tz)
+        except: 
+            base_date = tx_date
+    elif card_rules and closing == 0 and due == 0: 
+        base_date = tx_date
     elif "crédito" in method_str or "credito" in method_str:
         if card_rules: base_date = calculate_invoice_due_date(tx_date, closing, due)
         else: base_date = tx_date + relativedelta(months=1)
-    else: base_date = tx_date
+    else: 
+        base_date = tx_date
 
     cash_keywords = ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança", "benefício", "pré-pago"]
     is_cash_payment = any(word in method_str for word in cash_keywords)
     
     payment_status = "PAID" if (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str else "PENDING"
-    date_paid = tx_date.strftime("%d/%m/%Y") if payment_status == "PAID" else None
+    
+    # --- NOVA LÓGICA: REALOCAÇÃO DE REGIME DE CAIXA (PAGAMENTO ANTECIPADO) ---
+    if payment_status == "PAID":
+        # Se a data de vencimento extraída for no futuro, mas foi pago HOJE, a data real é hoje.
+        if tx_date > today_dt:
+            real_pay_date = today_dt
+        else:
+            real_pay_date = tx_date
+            
+        date_paid_str = real_pay_date.strftime("%d/%m/%Y")
+        base_payment_month = real_pay_date.strftime("%m/%Y")
+    else:
+        date_paid_str = None
+        base_payment_month = None
+
     paid_value = installment_value if payment_status == "PAID" else 0.0
 
     for i in range(actual_installments):
-        # relativedelta perfectly jumps exact months (e.g., 15/05 -> 15/06 -> 15/07)
         installment_date = base_date + relativedelta(months=i)
+        
+        # Se foi pago, força o mês da parcela a ser o mês do pagamento real para bater com o Extrato
+        assigned_month = base_payment_month if payment_status == "PAID" else installment_date.strftime("%m/%Y")
+        
         details.append({
-            "mes": installment_date.strftime("%m/%Y"), 
+            "mes": assigned_month, 
             "data_vencimento": installment_date.strftime("%d/%m/%Y"), 
             "valor": installment_value, "status_pagamento": payment_status,
-            "dt_pagamento": date_paid, "valor_pago": paid_value
+            "dt_pagamento": date_paid_str, "valor_pago": paid_value
         })
     return details
 
@@ -423,7 +449,11 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
         if user_data.get("is_pdf") or method in clean_words or not is_method_trusted:
             user_data["estado"] = "AGUARDANDO_METODO_PAGAMENTO"
             if tx_type == "RECEITA":
-                keyboard = ReplyKeyboardMarkup([["Pix", "Conta Corrente/Poupança"], ["Dinheiro", "⏳ Ainda não recebi (Previsto)"]], resize_keyboard=True, one_time_keyboard=True)
+                keyboard = ReplyKeyboardMarkup([
+                    ["Pix", "Conta Corrente/Poupança"], 
+                    ["Cartão de Benefício", "Dinheiro"],
+                    ["⏳ Ainda não recebi (Previsto)"]
+                ], resize_keyboard=True, one_time_keyboard=True)
                 await bot.send_message(chat_id, f"📄 Recebimento de *{loc_name}* (R$ {tx_val:.2f})\nOnde esse valor entrará?", reply_markup=keyboard, parse_mode="Markdown")
             else:
                 keyboard = ReplyKeyboardMarkup([["Cartão de Crédito", "Cartão de Débito"], ["Pix", "Dinheiro", "Boleto"], ["Financiamento", "⏳ Ainda não paguei (Aberto)"]], resize_keyboard=True, one_time_keyboard=True)
@@ -437,12 +467,17 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             return
 
         # Step 3: Validate Card Info (if applicable)
-        if ("cartão" in method or "cartao" in method or "crédito" in method or "débito" in method) and "benefício" not in method:
+        method_needs_card = any(word in method for word in ["cartão", "cartao", "crédito", "credito", "débito", "debito", "benefício", "beneficio"])
+        
+        if method_needs_card:
             if not bank:
                 buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in list_cards_from_db()]
                 buttons.append(["➕ Adicionar Novo Cartão"])
                 user_data["estado"] = "AGUARDANDO_SELECAO_CARTAO"
-                await bot.send_message(chat_id, f"💳 Compra em *{loc_name}* (R$ {tx_val:.2f})\nQual cartão foi usado?", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True), parse_mode="Markdown")
+                
+                # Dinamiza a pergunta se for entrada ou saída
+                verb = "Recebimento" if tx_type == "RECEITA" else "Compra"
+                await bot.send_message(chat_id, f"💳 {verb} em *{loc_name}* (R$ {tx_val:.2f})\nQual cartão?", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True), parse_mode="Markdown")
                 return
             else:
                 db_card = get_card_from_db(bank, variant)
@@ -691,7 +726,8 @@ async def ask_for_payment_amount(bot, chat_id, query, target_month, pay_date, bi
 async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str):
     """
     Renders the Financial Ledger (Extrato) on Telegram.
-    Now includes dynamic installment tracking (e.g., 8/10) embedded in the monospaced layout.
+    Now includes a visual tag [B] in the monospace list to explicitly show 
+    which items were successfully isolated into the Benefit Balance.
     """
     transactions = get_cash_flow_by_month(target_month)
     
@@ -702,11 +738,14 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     ben_tx = []
     
     for t in transactions:
-        m = t['method'].lower()
-        if "benefício" in m or "beneficio" in m or "pré-pago" in m or "pre-pago" in m or "vr" in m or "va" in m:
+        # Junta todas as colunas que podem conter a palavra chave
+        m = f"{t.get('method', '')} {t.get('bank', '')} {t.get('variant', '')}".lower()
+        if "benefício" in m or "beneficio" in m or "pré-pago" in m or "pre-pago" in m or "vr" in m or "va" in m or "caju" in m:
             ben_tx.append(t)
+            t['is_benefit'] = True # Flag para a interface
         else:
             main_tx.append(t)
+            t['is_benefit'] = False
 
     rec_pagas = sum(t['paid_amount'] for t in main_tx if t['type'] == 'RECEITA' and t['status'] == 'PAID')
     rec_prev = sum(t['expected_amount'] for t in main_tx if t['type'] == 'RECEITA' and t['status'] == 'PENDING')
@@ -755,11 +794,14 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
             amt_formatted = fmt_money(amount_val)
             amt_str = f"{amt_formatted}" if is_income else f"({amt_formatted})"
             
-            # --- INSTALLMENT STRING BUILDER ---
             loc_raw = t['location'].strip().title()
+            
+            # --- TAG VISUAL DE BENEFÍCIO ---
+            if t.get('is_benefit'):
+                loc_raw = f"[B] {loc_raw}"
+            
             if t.get('is_installment') and t.get('installment_count', 1) > 1:
                 parcel_str = f" {t['inst_num']}/{t['installment_count']}"
-                # Calcula o espaço restante para o nome do local não estourar a linha
                 max_loc_len = max(0, 14 - len(parcel_str))
                 loc = f"{loc_raw[:max_loc_len]}{parcel_str}"
             else:
@@ -767,9 +809,7 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
             
             tag = " " if is_paid else "*"
             
-            # Formatação alinhada: Local (14), Data (5), Valor (10)
             line = f"{loc:<14} {date_str} - {amt_str:>10} {tag}"
-            
             text += line + "\n"
 
         text += "```\n"
@@ -884,12 +924,15 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
                 "💸 *COMO PAGAR / BAIXAR*\n\n"
                 "📌 *Parcela avulsa:* Clique em qualquer item → *Pagar / Antecipar*\n"
                 "📌 *Fatura completa:* Clique no header 💳 → *Pagar Fatura Fechada*\n\n"
-                "O bot vai pedir a *data* e o *valor pago*:\n"
-                "• Clique em 📅 Hoje ou digite `DD/MM/AAAA`\n"
-                "• Clique em 💰 Valor Integral ou *digite um valor menor* se houve desconto\n\n"
-                "💡 *Antecipação com desconto:* Se você pagou menos que o valor original "
-                "(ex: negociou desconto à vista), o bot registra a diferença como desconto "
-                "na compra e ajusta o saldo automaticamente."
+                "O bot pedirá a *data*, o *método* e o *valor pago*:\n"
+                "• Clique em 📅 Hoje ou digite a data (`DD/MM/AAAA`)\n"
+                "• Confirme de onde o dinheiro saiu\n"
+                "• Clique em Valor Integral ou digite um menor (desconto)\n\n"
+                "💡 *Dica: Boleto Futuro pago no Passado*\n"
+                "Pagou um boleto de Maio *ontem*, mas enviou o PDF só hoje? Se você marcar como pago na hora, o Zotto assumirá a data de *hoje*. Para o registro contábil perfeito:\n\n"
+                "1️⃣ *Lance como Previsto:* Envie o PDF e clique em *⏳ Ainda não paguei (Aberto)*. Ele salva no mês do vencimento.\n"
+                "2️⃣ *Dê a baixa manual:* Abra o `/contas`, vá até o mês do vencimento e clique em *Pagar/Antecipar*.\n"
+                "3️⃣ *Controle Absoluto:* Quando pedir a data, ignore o botão 'Hoje' e *digite a data de ontem* (Ex: `06/04/2026`). O Zotto puxará a conta pro extrato no dia exato!"
             )
         elif topic == "avancado":
             text = (
@@ -986,18 +1029,29 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill = next((b for b in bills if str(b['id']) == str(bill_id)), None)
         is_income = bill and bill.get('type', 'DESPESA') == 'RECEITA'
         
-        context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
+        context.user_data["estado"] = "WAITING_FOR_BAIXA_METHOD"
         context.user_data["parcela_pagamento_id"] = bill_id
         context.user_data["parcela_target_month"] = target_month
         context.user_data["is_group_payment"] = False
+        context.user_data["is_income"] = is_income
         
-        keyboard = [
-            [InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_{bill_id}")],
-            [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]
-        ]
-        
-        question_text = "📅 *Qual a data do recebimento?*" if is_income else "📅 *Qual a data do pagamento?*"
-        await query.edit_message_text(f"{question_text}\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        if is_income:
+            keyboard = [
+                ["Pix", "Conta Corrente/Poupança"], 
+                ["Cartão de Benefício", "Dinheiro"],
+                ["🔄 Manter Método Original"]
+            ]
+            text = "💸 *Onde este valor entrou?*"
+        else:
+            keyboard = [
+                ["Cartão de Crédito", "Cartão de Débito"], 
+                ["Pix", "Dinheiro", "Boleto"],
+                ["Cartão de Benefício", "🔄 Manter Método Original"]
+            ]
+            text = "💸 *Como você pagou esta conta?*"
+            
+        await query.edit_message_text("Prosseguindo com a baixa...", parse_mode="Markdown")
+        await context.bot.send_message(update.effective_chat.id, text, reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True), parse_mode="Markdown")
 
     elif data.startswith("paygroup_"):
         parts = data.split("_")
@@ -1035,9 +1089,16 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill_id = int(data.split("_")[3])
         pay_date = context.user_data.get("parcela_pagamento_data")
         
-        success, msg = pay_bill_in_db(bill_id, pay_date, None)
+        # Puxa os métodos novos salvos na sessão
+        n_method = context.user_data.get("baixa_new_method")
+        n_bank = context.user_data.get("baixa_new_bank")
+        n_variant = context.user_data.get("baixa_new_variant")
+        
+        success, msg = pay_bill_in_db(bill_id, pay_date, None, new_method=n_method, new_bank=n_bank, new_variant=n_variant)
+        
         if success: 
             await query.edit_message_text(msg, parse_mode="Markdown")
+            await context.bot.send_message(update.effective_chat.id, "✅ Operação concluída.", reply_markup=ReplyKeyboardRemove())
         else:
             await query.edit_message_text(f"❌ {msg}", parse_mode="Markdown")
         context.user_data.clear()
@@ -1106,11 +1167,58 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get("estado")
     try:
+        # FSM: Paying a Bill -> Asking Method
+        if state == "WAITING_FOR_BAIXA_METHOD":
+            ans = update.message.text.strip()
+            if ans != "🔄 Manter Método Original":
+                context.user_data["baixa_new_method"] = ans
+            else:
+                context.user_data["baixa_new_method"] = None
+                
+            method_needs_card = any(word in ans.lower() for word in ["cartão", "cartao", "crédito", "credito", "débito", "debito", "benefício", "beneficio"])
+            
+            if method_needs_card and ans != "🔄 Manter Método Original":
+                buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in list_cards_from_db()]
+                buttons.append(["❌ Cancelar Ação"])
+                context.user_data["estado"] = "WAITING_FOR_BAIXA_CARD"
+                await update.message.reply_text("💳 Qual cartão?", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True))
+                return
+                
+            context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
+            bill_id = context.user_data["parcela_pagamento_id"]
+            action_word = "recebimento" if context.user_data.get("is_income") else "pagamento"
+            
+            await update.message.reply_text("✅ Método registrado.", reply_markup=ReplyKeyboardRemove())
+            keyboard = [[InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_{bill_id}")], [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]]
+            await update.message.reply_text(f"📅 *Qual a data do {action_word}?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            return
+            
+        # FSM: Paying a Bill -> Asking Card
+        if state == "WAITING_FOR_BAIXA_CARD":
+            ans = update.message.text.strip()
+            if ans == "❌ Cancelar Ação":
+                context.user_data.clear()
+                await update.message.reply_text("🛑 Ação cancelada.", reply_markup=ReplyKeyboardRemove())
+                return
+                
+            parts = ans.split(" ", 1)
+            context.user_data["baixa_new_bank"] = parts[0]
+            context.user_data["baixa_new_variant"] = parts[1] if len(parts) > 1 else ""
+            
+            context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
+            bill_id = context.user_data["parcela_pagamento_id"]
+            action_word = "recebimento" if context.user_data.get("is_income") else "pagamento"
+            
+            await update.message.reply_text("✅ Cartão registrado.", reply_markup=ReplyKeyboardRemove())
+            keyboard = [[InlineKeyboardButton("📅 Hoje", callback_data=f"paydate_hoje_{bill_id}")], [InlineKeyboardButton("❌ Cancelar Ação", callback_data="cancel_fsm")]]
+            await update.message.reply_text(f"📅 *Qual a data do {action_word}?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+            return
+
         # FSM: Paying a Bill -> Custom Date
         if state == "WAITING_FOR_PAYMENT_DATE":
             ans = update.message.text.lower().strip()
-            bill_id = context.user_data.get("parcela_pagamento_id")
             target_month = context.user_data.get("parcela_target_month")
+            is_group = context.user_data.get("is_group_payment", False)
             
             pay_date = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y") if ans == "hoje" else ans
             if not re.match(r'\d{2}/\d{2}/\d{4}', pay_date):
@@ -1119,7 +1227,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             context.user_data["parcela_pagamento_data"] = pay_date
             context.user_data["estado"] = "WAITING_FOR_PAYMENT_AMOUNT"
-            await ask_for_payment_amount(context.bot, chat_id, None, bill_id, target_month, pay_date)
+            
+            if is_group:
+                bank = context.user_data.get("group_bank")
+                variant = context.user_data.get("group_variant")
+                await ask_for_payment_amount(context.bot, chat_id, None, target_month, pay_date, group_bank=bank, group_variant=variant)
+            else:
+                bill_id = context.user_data.get("parcela_pagamento_id")
+                await ask_for_payment_amount(context.bot, chat_id, None, target_month, pay_date, bill_id=bill_id)
             return
             
         # FSM: Paying a Bill -> Custom Amount (Anticipation/Discount)
@@ -1148,7 +1263,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 success, msg = pay_grouped_card_bills_in_db(target_month, bank, variant, pay_date, custom_amount)
             else:
                 bill_id = context.user_data.get("parcela_pagamento_id")
-                success, msg = pay_bill_in_db(bill_id, pay_date, custom_amount)
+                n_method = context.user_data.get("baixa_new_method")
+                n_bank = context.user_data.get("baixa_new_bank")
+                n_variant = context.user_data.get("baixa_new_variant")
+                
+                success, msg = pay_bill_in_db(bill_id, pay_date, custom_amount, new_method=n_method, new_bank=n_bank, new_variant=n_variant)
 
             if success: 
                 await update.message.reply_text(msg, parse_mode="Markdown")

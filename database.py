@@ -520,10 +520,11 @@ def calculate_invoice_due_date_db(action_date, closing_day, due_day):
         base_month += relativedelta(months=1)
     return base_month + relativedelta(day=due_day)
 
-def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
+def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None, new_method=None, new_bank=None, new_variant=None):
     """
     Motor Avançado de Pagamento e Antecipação (Regime de Caixa).
     Diferencia antecipação de contas à vista vs cartões de crédito.
+    Agora permite sobrescrever o método de pagamento no ato da baixa.
     """
     if not db_pool: return False, "Erro de Conexão."
     conn = None
@@ -545,6 +546,17 @@ def pay_bill_in_db(installment_id, payment_date_str, custom_paid_amount=None):
         if not row: return False, "Parcela não encontrada."
         
         original_amount, trans_id, inst_month, inst_due, bank, variant, method = row
+        
+        # --- NOVO BLOCO: ATUALIZA MÉTODO DE PAGAMENTO SE FORNECIDO ---
+        if new_method:
+            method = new_method
+            bank = new_bank
+            variant = new_variant
+            cursor.execute("""
+                UPDATE transactions 
+                SET payment_method = %s, card_bank = %s, card_variant = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (method, bank, variant, trans_id))
         
         final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else float(original_amount)
         discount = float(original_amount) - final_paid_amount
@@ -800,8 +812,8 @@ def get_max_month_for_transaction(installment_id):
 def get_cash_flow_by_month(month_year):
     """
     Fetches the complete Cash Flow statement for a specific month.
-    Uses a CTE with ROW_NUMBER() to dynamically calculate the original 
-    installment index (e.g., 8 of 10) regardless of due date changes.
+    Now specifically retrieves card_bank and card_variant to properly 
+    isolate Benefit cards even if the payment method is generic.
     """
     if not db_pool: return []
     conn = None
@@ -817,7 +829,8 @@ def get_cash_flow_by_month(month_year):
             SELECT i.id, t.location_name, to_char(i.due_date, 'DD/MM/YYYY'), 
                    to_char(i.payment_date, 'DD/MM/YYYY'), i.amount, i.paid_amount, 
                    t.transaction_type, i.payment_status, t.payment_method,
-                   t.is_installment, t.installment_count, n.inst_num
+                   t.is_installment, t.installment_count, n.inst_num,
+                   t.card_bank, t.card_variant -- Colunas adicionadas aqui!
             FROM installments i 
             JOIN transactions t ON i.transaction_id = t.id
             JOIN InstNums n ON i.id = n.id
@@ -837,7 +850,9 @@ def get_cash_flow_by_month(month_year):
             "method": str(r[8] or ""),
             "is_installment": bool(r[9]),
             "installment_count": int(r[10] or 1),
-            "inst_num": int(r[11] or 1)
+            "inst_num": int(r[11] or 1),
+            "bank": str(r[12] or ""),     # Recuperando o Banco
+            "variant": str(r[13] or "")   # Recuperando a Variante
         } for r in cursor.fetchall()]
     except Exception as e:
         print(f"[DB ERROR] get_cash_flow_by_month: {e}")
