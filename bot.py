@@ -15,6 +15,9 @@ from pypdf import PdfReader
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from groq import AsyncGroq
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, Response
+import uvicorn
 
 from database import (
     create_tables, save_transactions_to_db, get_card_from_db, save_card_to_db, list_cards_from_db, 
@@ -1441,28 +1444,60 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
-# --- Application Entry Point ---
+# --- Application Entry Point & Webhook Setup ---
+
+# Builds the Telegram Bot application
+telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+# Hooks the background worker queue_processor to run every 10 seconds asynchronously 
+telegram_app.job_queue.run_repeating(queue_processor, interval=10, first=5)
+    
+# Registers command routers
+telegram_app.add_handler(CommandHandler("start", start_command))
+telegram_app.add_handler(CommandHandler("cancelar", cancel_command))
+telegram_app.add_handler(CommandHandler("contas", list_pending_bills))
+telegram_app.add_handler(CommandHandler("extrato", extrato_command))
+telegram_app.add_handler(CommandHandler("help", help_command))
+telegram_app.add_handler(CallbackQueryHandler(handle_inline_button)) 
+telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Executa ao iniciar o servidor (Startup)
+    await telegram_app.initialize()
+    await telegram_app.start()
+    print("✅ Telegram App iniciado e ouvindo via Webhook!")
+    yield
+    # Executa ao desligar o servidor (Shutdown)
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+    print("🛑 Telegram App desligado com segurança.")
+
+api = FastAPI(lifespan=lifespan)
+
+@api.post("/webhook")
+async def process_webhook(request: Request):
+    """O endpoint onde o Telegram baterá a porta para entregar mensagens."""
+    req = await request.json()
+    update = Update.de_json(req, telegram_app.bot)
+    await telegram_app.process_update(update)
+    return Response(status_code=200)
+
+@api.get("/health")
+async def health_check():
+    """Endpoint vital para o Railway saber que seu app está vivo."""
+    return {"status": "Zotto API is running", "env": ENV}
+
 if __name__ == '__main__':
     create_tables()
-    print(f"🚀 Iniciando app em ({ENV.upper()})...")
+    print(f"🚀 Iniciando Zotto em ambiente ({ENV.upper()})...")
     
-    # Builds the Telegram Bot application loop
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Hooks the background worker queue_processor to run every 10 seconds asynchronously 
-    app.job_queue.run_repeating(queue_processor, interval=10, first=5)
-    
-    # Registers command routers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("cancelar", cancel_command))
-    app.add_handler(CommandHandler("contas", list_pending_bills))
-    app.add_handler(CommandHandler("extrato", extrato_command))
-    app.add_handler(CommandHandler("help", help_command))
-    
-    # Registers payload routers
-    app.add_handler(CallbackQueryHandler(handle_inline_button)) 
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
-    
-    # Starts Long Polling (listening to Telegram servers)
-    app.run_polling()
+    if ENV == "prod":
+        # EM PRODUÇÃO: Roda o servidor web FastAPI para receber Webhooks
+        port = int(os.getenv("PORT", 8000))
+        uvicorn.run(api, host="0.0.0.0", port=port)
+    else:
+        # EM DEV: Roda no modo Polling (para você testar no PC sem Ngrok)
+        print("🔄 Modo Webhook ignorado. Iniciando Long Polling local...")
+        telegram_app.run_polling()
