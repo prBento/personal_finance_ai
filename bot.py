@@ -338,7 +338,11 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                     tx["valor_original"] = sum_items
                     tx["desconto_aplicado"] = calc_discount
                     
-            if not tx.get("dt_transacao") or tx.get("dt_transacao") == "null": tx["dt_transacao"] = today_str
+            raw_dt = str(tx.get("dt_transacao", "")).strip()
+            if re.match(r'^\d{2}/\d{2}$', raw_dt):
+                tx["dt_transacao"] = f"{raw_dt}/{datetime.now(timezone(timedelta(hours=-3))).year}"
+            elif not raw_dt or raw_dt.lower() == "null" or len(raw_dt) < 5:
+                tx["dt_transacao"] = today_str
             
             for idx, it in enumerate(tx.get("itens", []), start=1):
                 it["numero_item_nota"] = str(idx)
@@ -360,21 +364,20 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
             br_now = datetime.now(timezone(timedelta(hours=-3)))
             wait_seconds = 60
             
-            # TPD (Tokens Per Day) check -> Defers to 9 AM next day
+            # TPD (Tokens Per Day) check -> Defers to 90 min
             if "tokens per day" in error_msg or "tpd" in error_msg:
-                next_day = br_now + timedelta(days=1)
-                next_9am = next_day.replace(hour=9, minute=0, second=0, microsecond=0)
-                wait_seconds = int((next_9am - br_now).total_seconds())
+                wait_seconds = 5400 # 90 minutes
+                br_time = br_now + timedelta(seconds=wait_seconds)
                 
-                print(f"⏳ [RATE LIMIT TPD] Limite diário estourado. Retentativa agendada para as 09:00 de amanhã (BRT).")
+                print(f"⏳ [RATE LIMIT TPD] IA sobrecarregada. Retentativa agendada para {br_time.strftime('%H:%M:%S')} (BRT).")
                 reschedule_queue_item(item['id'], wait_seconds, current_attempt, 999) # 999 prevents permanent failure
                 
                 if current_attempt == 0:
                     await context.bot.send_message(
                         chat_id, 
-                        f"⚠️ *Limite Diário da IA atingido (TPD).* 🛑\n\n"
+                        f"⚠️ *IA indisponível (TPD).* 🛑\n\n"
                         f"⏳ O seu registro está salvo na fila de espera.\n"
-                        f"A retentativa automática ocorrerá amanhã a partir das *09:00h*.\n"
+                        f"A retentativa automática será às {br_time.strftime('%H:%M')}.\n"
                         f"Assim que processado, envio o resumo para você confirmar.",
                         parse_mode="Markdown"
                     )
@@ -1252,6 +1255,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             is_group = context.user_data.get("is_group_payment", False)
             
             pay_date = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y") if ans == "hoje" else ans
+
+            if re.match(r'^\d{2}/\d{2}$', pay_date):
+                pay_date = f"{pay_date}/{datetime.now(timezone(timedelta(hours=-3))).year}"
+
             if not re.match(r'\d{2}/\d{2}/\d{4}', pay_date):
                 await update.message.reply_text("❌ Formato inválido. Use DD/MM/YYYY ou 'hoje'.")
                 return
@@ -1335,6 +1342,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # FSM: Adding Transaction -> User defines Financing/Boleto first installment date
         if state == "AGUARDANDO_DATA_PRIMEIRA_PARCELA":
             ans = update.message.text.strip()
+
+            if re.match(r'^\d{2}/\d{2}$', ans):
+                ans = f"{ans}/{datetime.now(timezone(timedelta(hours=-3))).year}"
             if not re.match(r'\d{2}/\d{2}/\d{4}', ans):
                 await update.message.reply_text("❌ Formato inválido. Use DD/MM/YYYY (Ex: 15/05/2026).")
                 return
