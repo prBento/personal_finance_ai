@@ -2,25 +2,21 @@
 *(Para a versão em Português, [clique aqui](#-versão-em-português-brasileiro))*
 
 ## 👨‍💻 Author
-**Bento**
-- GitHub: [@prBento](https://github.com/prBento)
+**Bento** — GitHub: [@prBento](https://github.com/prBento)
 
 ---
 
 ## 🇺🇸 English Version
 
 **Project:** Zotto — Finance AI Data App
-**Role:** Full-Stack Data Engineer & Product Owner
 
 ---
 
 ### 1. Architecture Overview
 
-This system is a **Full-Stack Data Application** built on a **Hybrid AI Architecture**. The core design philosophy is a strict separation of concerns between intelligence and determinism: LLMs are used exclusively for translating unstructured human language and chaotic documents into structured data, while Python handles all deterministic operations: financial mathematics, state management, and data governance.
+**Hybrid AI Architecture** with strict separation between intelligence and determinism. LLMs handle unstructured-to-structured translation only. Python handles all financial math, state management, and governance.
 
-The system is cloud-native, deployed on Railway PaaS, and built around an event-driven **Transactional Outbox Pattern** to ensure no user message is ever lost, regardless of API availability.
-
-**Data Flow:** *User input (text, URL, PDF) → Telegram Bot → PostgreSQL Queue → Background Worker → Dual LLM Pipeline (Extract → Enrich) → Human Confirmation UI → Relational Database.*
+**Dual-mode deployment:** In `prod`, FastAPI + Uvicorn serves a Telegram Webhook endpoint on the Railway-provisioned PORT. In `dev`, the same codebase falls back to Long Polling — no Ngrok required. Branch: `if ENV == "prod": uvicorn.run(api)` else `telegram_app.run_polling()`.
 
 ---
 
@@ -28,97 +24,77 @@ The system is cloud-native, deployed on Railway PaaS, and built around an event-
 
 | # | Component | Technology | Responsibility |
 |---|-----------|------------|----------------|
-| 1 | **Entry Interface** | `python-telegram-bot` | Async user touchpoint. State Machine + Inline UI. |
-| 2 | **Outbox Queue** | PostgreSQL `process_queue` | Decouples ingestion from processing. Guarantees delivery. |
-| 3 | **Document Intelligence** | `BeautifulSoup4`, `PyPDF` | Scrapes NFC-e URLs and extracts text from PDF utility bills. |
-| 4 | **AI Engine — Agent 1** | Groq API (`llama-4-scout-17b`) | Extracts raw entities. `temperature=0.0`. Includes hidden discount detection. |
-| 5 | **AI Engine — Agent 2** | Groq API (`llama-4-scout-17b`) | Enriches and categorizes with disambiguation rules. `temperature=0.1`. |
-| 6 | **Backend Engine** | Python | Math validation, installment calculation, duplicate detection, discount detection. |
-| 7 | **AP/AR Dashboard** | Telegram Inline UI | Grouped invoice view, isolated view, income/expense differentiation. |
-| 8 | **Cash Flow Statement** | Telegram Inline UI | Monthly extrato with benefit wallet separation and installment tracking. |
-| 9 | **Database** | PostgreSQL | Relational storage with AP/AR Ledger, SCD audit columns, CTE-powered queries. |
+| 1 | **Entry Interface** | `python-telegram-bot` | Async handlers, State Machine, Inline UI |
+| 2 | **Web Server (prod)** | FastAPI + Uvicorn | `POST /webhook`, `GET /health` |
+| 3 | **Outbox Queue** | PostgreSQL `process_queue` | Decouples ingestion from processing. Guaranteed delivery. |
+| 4 | **Document Intelligence** | `BeautifulSoup4`, `PyPDF` | NFC-e URL scraping and PDF text extraction |
+| 5 | **AI Agent 1** | Groq `llama-4-scout-17b` | Raw entity extraction. `temperature=0.0`. Chain-of-Thought date parsing. |
+| 6 | **AI Agent 2** | Groq `llama-4-scout-17b` | Categorization with disambiguation rules. `temperature=0.1`. |
+| 7 | **AP/AR Dashboard** | Telegram Inline UI | Accordion invoice view, isolated view, income/expense differentiation |
+| 8 | **Cash Flow Statement** | Telegram Inline UI | `/extrato` with benefit wallet separation and dynamic installment index |
+| 9 | **Payment Engine** | `database.py` | Anticipation logic, cash-basis reallocation, dynamic method override |
+| 10 | **Database** | PostgreSQL | Relational AP/AR ledger. SCD audit columns. CTE-powered queries. |
 
 ---
 
 ### 3. Functional Requirements (FRs)
 
-* **FR01 — Multimodal Ingestion:** The bot must accept and process three input types: free-text messages, HTML via NFC-e URLs, and PDF documents.
-* **FR02 — AI Extraction & Routing:** Dual LLM pipeline extracts entities, infers missing data, and routes to `RECEITA` or `DESPESA` logic.
-* **FR03 — Hidden Discount Detection:** After LLM processing, if the mathematical sum of items exceeds the invoice total, the backend calculates and registers the difference as a discount automatically — catching discounts the LLM missed.
-* **FR04 — Installment Calculation (AP/AR Ledger):** Custom engine splits amounts across N installments with correct due dates per Brazilian credit card billing rules.
-* **FR05 — Human-in-the-Loop Confirmation:** Structured Markdown summary with explicit user confirmation before any database write.
-* **FR06 — AP/AR Management Dashboard (`/contas`):**
-  - Groups credit card installments under a consolidated "Fatura" header.
-  - Differentiates Incomes (🟢/🟡) from Expenses (🔹/🔴) visually and in all action texts.
-  - Overdue bill alerts, month navigation, Fast-Forward (⏭️), and Return to Current Month.
-  - Isolated View for tracking a single multi-month purchase timeline.
-  - Escape hatches (Close Panel, Cancel Action) at every step.
-* **FR07 — Individual Bill Payment:** Pay a single installment/receipt, optionally with discount for early payment.
-* **FR08 — Group Invoice Payment (Cash Basis):** Pay all installments of a credit card in one action. The `month` field is updated to the payment month, aligning with **Cash Basis Accounting** so the `/extrato` reflects when money actually moved, not when it was due.
-* **FR09 — Installment Cancellation (Reconciliation):** Soft-delete a specific installment (`CANCELED`) for bank reconciliation without affecting other installments of the same purchase.
-* **FR10 — Isolated View:** Filter the AP panel to a single transaction's full installment timeline.
-* **FR11 — Cash Flow Statement (`/extrato`):**
-  - Monthly summary showing Saldo Atual (actual balance) and Saldo Projetado (projected balance).
-  - Separates **Main Wallet** (cash, Pix, credit card) from **Benefit Wallet** (VA/VR/prepaid cards) with independent balances.
-  - Detailed transaction list in monospaced format with dynamic installment index (e.g., `8/10`), date, and amount columns.
-  - Pending/future items marked with `*` indicator.
-  - Month navigation with Return to Current Month.
-* **FR12 — Duplicate Detection:** Exact `invoice_number` match + fuzzy `(location ILIKE + amount + date)` heuristic.
-* **FR13 — Credit Card Management:** Register new cards mid-flow with closing/due day rules for automatic invoice cycle calculation.
+* **FR01** — Multimodal ingestion: free-text, NFC-e URL, PDF.
+* **FR02** — Dual LLM pipeline with disambiguation ruleset (NF-e → always DESPESA; Total Pass → Academia; iFood → Alimentação; streaming → Assinaturas).
+* **FR03** — Hidden discount detection: `if sum(items) > invoice_total` → auto-register difference as discount.
+* **FR04** — Custom installment engine with Brazilian credit card billing rules (fechamento/vencimento cycles).
+* **FR05** — Human-in-the-Loop confirmation before every database write. Summary shows discount breakdown when applicable.
+* **FR06** — AP/AR Dashboard (`/contas`): accordion credit card grouping, income vs expense visual differentiation, overdue alerts, isolated view, fast-forward navigation, escape hatches.
+* **FR07** — Smart payment settlement: dynamic method override at pay time. Credit card anticipation moves installment to next invoice cycle (stays PENDING). Cash/Pix marks PAID and reallocates `month` field.
+* **FR08** — Group invoice payment with proportional discount distribution across all items.
+* **FR09** — Installment soft-delete (`CANCELED`) for bank reconciliation.
+* **FR10** — Cash Flow Statement (`/extrato`): Saldo Atual + Projetado, benefit wallet isolation, `[B]` tag in monospaced list, dynamic installment index (`8/10`), pending item `*` indicator.
+* **FR11** — Interactive help system: inline button menu with topic-specific sub-pages and back navigation.
+* **FR12** — Duplicate detection: exact `invoice_number` match + fuzzy `(location ILIKE + amount + date)`.
 
 ---
 
 ### 4. Non-Functional Requirements (NFRs)
 
-* **NFR01 — Resilience (Outbox Pattern):** Queue all messages immediately; process asynchronously. No message lost due to API unavailability.
-* **NFR02 — Exponential Backoff:** Standard errors: 60s–3600s. TPD (Tokens Per Day) limits: defer to 09:00 AM next day.
-* **NFR03 — Dead Item Prevention:** Items beyond `max_attempts` (default: 5) marked as `DEAD`.
-* **NFR04 — Busy-State Queue Deferral:** `reschedule_queue_item_busy` defers without consuming a retry attempt when user is in active conversation.
-* **NFR05 — Connection Pool:** `ThreadedConnectionPool` (min: 1, max: 10) prevents connection exhaustion on Railway.
-* **NFR06 — Fault-Tolerant JSON Parsing:** Strips LLM hallucinations (comments, Python booleans, control chars) before parsing.
-* **NFR07 — Math Validation:** Recalculates `valor_total` from items if LLM returns zero; detects hidden discounts via item sum comparison.
-* **NFR08 — Access Control (Whitelist):** `ALLOWED_CHAT_IDS` enforced via `security_check` decorator on all public handlers.
-* **NFR09 — Stateless Security:** No hardcoded secrets; all via environment variables.
-* **NFR10 — Auditability (SCD):** `created_at`/`updated_at` on all tables. `transactions.status` synchronized with child `installments`.
-* **NFR11 — Proportional Discount Distribution:** Group invoice discounts distributed proportionally across installments and reflected in each parent transaction.
-* **NFR12 — Cash Basis Accounting:** Paid installments have their `month` field updated to the actual payment month, ensuring the `/extrato` reports on when money moved, not when it was scheduled.
-* **NFR13 — Dynamic Installment Indexing:** CTE with `ROW_NUMBER()` calculates the original installment sequence (e.g., "8 of 10") dynamically, even after month fields have been updated by cash-basis reconciliation.
+* **NFR01** — Resilience: Outbox Pattern + `FOR UPDATE SKIP LOCKED` for concurrent processing safety.
+* **NFR02** — Exponential Backoff: standard errors 60s–3600s; TPD rate limit defers 90 minutes.
+* **NFR03** — Dead item prevention: `max_attempts` (default 5) → status `DEAD`.
+* **NFR04** — Busy-state deferral: `reschedule_queue_item_busy` defers without consuming a retry attempt.
+* **NFR05** — Connection Pool: `ThreadedConnectionPool` (1–10).
+* **NFR06** — Fault-tolerant JSON: strips LLM hallucinations before `json.loads(..., strict=False)`.
+* **NFR07** — Math validation: recalculates totals from items post-LLM; detects hidden discounts.
+* **NFR08** — Access control: `ALLOWED_CHAT_IDS` via `security_check` decorator on all public handlers.
+* **NFR09** — Cash Basis Accounting: paid installment `month` updated to payment month. `/extrato` shows when money moved; `/contas` retains original `due_date` for bill management.
+* **NFR10** — CTE installment indexing: `ROW_NUMBER() OVER (PARTITION BY transaction_id ORDER BY id ASC)` survives `month` field updates.
+* **NFR11** — Dual deployment: `if ENV == "prod": uvicorn.run(api)` else `telegram_app.run_polling()`.
 
 ---
 
 ### 5. Architectural Decisions: The "Why?"
 
-#### 5.1. Why a Dual-Agent LLM Pipeline?
-**Decision:** Two sequential calls — Agent 1 extracts (`temperature=0.0`), Agent 2 categorizes (`temperature=0.1`).
-**Justification:** Isolated failure modes, calibrated temperatures per task, and auditable stages. The `_raciocinio_vencimento` Chain-of-Thought field in Agent 1 forces deliberate date reasoning, preventing the most common extraction error in PDFs.
+#### 5.1. Dual-Agent LLM Pipeline
+Isolated failure modes and calibrated temperatures per task. Chain-of-Thought date reasoning via `_raciocinio_vencimento` field prevents the most common PDF extraction error (emission date vs. due date).
 
-#### 5.2. Why the Transactional Outbox Pattern?
-**Decision:** Every message hits PostgreSQL before any LLM call.
-**Justification:** Guaranteed delivery, instant UX ("Received" in < 100ms), and `FOR UPDATE SKIP LOCKED` for race-condition-safe concurrent processing.
+#### 5.2. Transactional Outbox Pattern
+Instant UX (< 100ms "Received"). Guaranteed delivery. `FOR UPDATE SKIP LOCKED` prevents race conditions without distributed locks.
 
-#### 5.3. Why a custom Installment Engine?
-**Decision:** `generate_installment_details` built on `dateutil.relativedelta`.
-**Justification:** Brazilian credit card billing rules (fechamento/vencimento cycles) are not modeled by standard financial libraries.
+#### 5.3. Custom Installment Engine
+Brazilian credit card billing (fechamento/vencimento) is not modeled by any standard financial library.
 
-#### 5.4. Why Cash Basis Accounting for the `/extrato`?
-**Decision:** When a credit card invoice is paid, the `month` field of all its installments is updated to the payment month.
-**Justification:** *The extrato reflects reality, not predictions.* Under accrual accounting, a purchase made in April appearing on a June invoice would show in April. Under cash basis, it appears in June when money actually left the account. For personal finance tracking, cash basis is more actionable — it matches your bank statement. The AP/AR panel (`/contas`) retains the original due dates for bill management, while the extrato uses the cash-basis month for financial reporting.
+#### 5.4. Credit Card Anticipation vs. Cash Payment
+Paying a credit card installment early recalculates the target invoice cycle and moves the debt there — stays PENDING. This models how credit cards actually work. All non-card payments mark PAID and reallocate `month` for cash-basis reporting.
 
-#### 5.5. Why separate the Benefit Wallet?
-**Decision:** Transactions paid via VA/VR/benefício/pré-pago are calculated in a separate balance from the main wallet.
-**Justification:** *Benefit cards are not fungible with cash.* Money in a meal voucher (VA) cannot pay utilities. Mixing both into a single balance would give a misleading picture of actual cash available. Displaying them separately gives accurate visibility into both pools.
+#### 5.5. FastAPI + Long Polling Dual Mode
+Webhook requires a public HTTPS URL that doesn't exist locally. The `if ENV == "prod"` branch keeps the same codebase working in both environments with zero extra tooling for local dev.
 
-#### 5.6. Why `ROW_NUMBER()` CTE for installment indexing?
-**Decision:** `get_cash_flow_by_month` uses a CTE to assign installment numbers dynamically.
-**Justification:** *The original sequence must survive month updates.* When cash-basis reconciliation moves an installment's `month` field, the stored installment number would become meaningless. A `ROW_NUMBER() OVER (PARTITION BY transaction_id ORDER BY id ASC)` recalculates the sequence at query time from the immutable `id` column, always returning the correct "8 of 10" regardless of what happened to the `month` field.
+#### 5.6. `month` vs `due_date` — Two Date Fields by Design
+`due_date` is immutable (original contractual date). Used by `/contas` for overdue calculation. `month` is mutable (updated to payment month for cash-basis). Used by `/extrato` for financial reporting. They intentionally diverge after payment.
 
-#### 5.7. Why group credit card installments under a "Fatura" header in the UI?
-**Decision:** Installments sharing `card_bank`/`card_variant` are consolidated under a parent button.
-**Justification:** People pay credit card invoices, not individual purchases. The grouped view mirrors how banks present statements.
+#### 5.7. Benefit Wallet Separation
+VA/VR/prepaid balances are not fungible with cash. Mixing them gives a misleading picture of available liquidity.
 
-#### 5.8. Why PostgreSQL?
-**Decision:** Relational model with FK constraints and normalized tables.
-**Justification:** 1 transaction → N items → N installments. Referential integrity, typed columns, indexed dates, and aggregatable decimals are liabilities in NoSQL but assets here.
+#### 5.8. CTE `ROW_NUMBER()` for Installment Index
+The sequence must survive cash-basis `month` field updates. Computing from the immutable `id` column at query time always returns the correct "8 of 10".
 
 ---
 
@@ -129,37 +105,63 @@ credit_cards
     id, bank, variant, closing_day, due_day
 
 process_queue
-    id, chat_id, received_text, is_pdf, status, attempts, max_attempts, next_attempt
+    id, chat_id, received_text, is_pdf
+    status [PENDING | PROCESSING | COMPLETED | DEAD | CANCELLED]
+    attempts, max_attempts, next_attempt
 
-transactions  ←──────────────────────────────────────────────┐
-    id, transaction_type, invoice_number                      │ FK
-    transaction_date (DATE), location_name                    │
-    card_bank, card_variant, status [Ativa | PAID]            │
-    original_amount, discount_applied, total_amount           │
-    macro_category, payment_method                            │
-    is_installment, installment_count                         │
-                                                              │
-transaction_items  ──── transaction_id (FK) ──────────────────┤
-    description, brand, unit_price, quantity                  │
-    cat_macro, cat_category, cat_subcategory                  │
-                                                              │
-installments  ───────── transaction_id (FK) ──────────────────┘
-    month (MM/YYYY)  ← updated to payment month on cash-basis pay
-    due_date (DATE)  ← original due date, preserved for AP/AR
+transactions  ←─────────────────────────────────────────┐
+    id, transaction_type, invoice_number                 │ FK ON DELETE CASCADE
+    transaction_date (DATE), location_name               │
+    card_bank, card_variant                              │
+    status [Ativa | PAID]                                │
+    original_amount, discount_applied, total_amount      │
+    macro_category, payment_method                       │
+    is_installment, installment_count                    │
+                                                         │
+transaction_items ─── transaction_id (FK) ───────────────┤
+    description, brand, unit_price, quantity             │
+    cat_macro, cat_category, cat_subcategory             │
+                                                         │
+installments ──────── transaction_id (FK) ───────────────┘
+    month (MM/YYYY)  ← mutable: updated to payment month (cash basis)
+    due_date (DATE)  ← immutable: original contractual date
     amount, payment_status [PENDING | PAID | CANCELED]
     payment_date (DATE), paid_amount
-```
 
-**Key behavioral note:** `month` and `due_date` can diverge after a group invoice payment. `due_date` is always the original contractual date; `month` reflects when money actually moved (cash basis). The `/extrato` queries by `month`; the `/contas` panel uses `due_date` for overdue calculation.
+Indexes:
+  idx_installments_month_status ON installments(month, payment_status)
+  idx_queue_status_next         ON process_queue(status, next_attempt)
+  idx_transactions_date_type    ON transactions(transaction_date, transaction_type)
+```
 
 ---
 
-### 7. Security Strategy
+### 7. Deployment Architecture
 
-- **Decoupled Secrets:** `.env` locally, Railway Variables panel in production.
-- **Access Control:** `ALLOWED_CHAT_IDS` whitelist via `security_check` decorator on all handlers.
-- **Stateless Design:** PDFs deleted in `finally` blocks; no sensitive state on disk.
-- **SQL Injection Prevention:** All queries use parameterized `%s` placeholders.
+```
+Railway (prod)
+├── Service type: web  ← requires Procfile: "web: python bot.py"
+│   ├── FastAPI app binds to PORT env var
+│   ├── GET  /health   → Railway liveness probe
+│   └── POST /webhook  → telegram_app.process_update(update)
+│                          └── job_queue (10s) → queue_processor()
+└── Plugin: PostgreSQL (internal DATABASE_URL)
+
+Local (dev)
+└── python bot.py
+    └── telegram_app.run_polling()
+        └── job_queue (10s) → queue_processor()
+```
+
+---
+
+### 8. Security Strategy
+
+- **Secrets:** `.env` locally, Railway Variables panel in production. Never hardcoded.
+- **Access control:** `ALLOWED_CHAT_IDS` whitelist via `security_check` decorator on all public handlers.
+- **Stateless:** PDFs deleted in `finally` blocks. No sensitive state written to disk.
+- **SQL injection:** All queries use parameterized `%s` placeholders.
+- **Webhook security:** `/webhook` endpoint only accepts updates routed from Telegram's registered URL.
 
 ---
 ---
@@ -167,15 +169,14 @@ installments  ───────── transaction_id (FK) ──────
 ## 🇧🇷 Versão em Português Brasileiro
 
 **Projeto:** Zotto — Finance AI Data App
-**Papel:** Engenheiro de Dados Full-Stack & Dono do Produto
 
 ---
 
-### 1. Visão Geral da Arquitetura
+### 1. Visão Geral
 
-Sistema **Full-Stack** com **Arquitetura de IA Híbrida**. LLMs traduzem inputs desestruturados em dados; Python lida com matemática financeira, estados e governança. Nativo em nuvem no Railway PaaS, construído em torno do **Padrão de Outbox Transacional**.
+**Arquitetura de IA Híbrida.** LLMs traduzem inputs desestruturados. Python lida com toda a matemática financeira, estados e governança.
 
-**Fluxo de dados:** *Input do usuário → Telegram Bot → Fila PostgreSQL → Worker Background → Pipeline Dual LLM → UI de Confirmação → Banco Relacional.*
+**Deploy de dois modos:** Em `prod`, FastAPI + Uvicorn recebe Webhook do Telegram na PORT do Railway. Em `dev`, o mesmo código usa Long Polling sem configuração extra.
 
 ---
 
@@ -183,118 +184,25 @@ Sistema **Full-Stack** com **Arquitetura de IA Híbrida**. LLMs traduzem inputs 
 
 | # | Componente | Tecnologia | Responsabilidade |
 |---|-----------|------------|----------------|
-| 1 | **Interface de Entrada** | `python-telegram-bot` | Ponto de contato assíncrono. Máquina de estados + UI inline. |
-| 2 | **Fila Outbox** | PostgreSQL `process_queue` | Desacopla ingestão do processamento. Garante entrega. |
-| 3 | **Inteligência de Documentos** | `BeautifulSoup4`, `PyPDF` | Scraping NFC-e + extração de PDF. |
-| 4 | **Motor de IA — Agente 1** | Groq API (`llama-4-scout-17b`) | Extração bruta. `temperature=0.0`. Detecção de desconto oculto. |
-| 5 | **Motor de IA — Agente 2** | Groq API (`llama-4-scout-17b`) | Enriquecimento e categorização com regras de desambiguação. `temperature=0.1`. |
-| 6 | **Backend Engine** | Python | Validação matemática, cálculo de parcelas, detecção de duplicatas e descontos. |
-| 7 | **Dashboard AP/AR** | Telegram Inline UI | Faturas agrupadas, modo isolado, diferenciação Receita/Despesa. |
-| 8 | **Extrato de Fluxo de Caixa** | Telegram Inline UI | Extrato mensal com separação de carteira benefício e índice de parcelas. |
-| 9 | **Banco de Dados** | PostgreSQL | Armazenamento relacional com Livro Caixa, SCD e queries com CTE. |
+| 1 | **Interface** | `python-telegram-bot` | Handlers assíncronos, Máquina de Estados, UI inline |
+| 2 | **Servidor Web (prod)** | FastAPI + Uvicorn | `POST /webhook`, `GET /health` |
+| 3 | **Fila Outbox** | PostgreSQL `process_queue` | Garante entrega desacoplando ingestão do processamento |
+| 4 | **Inteligência de Docs** | `BeautifulSoup4`, `PyPDF` | Scraping NFC-e e extração de PDF |
+| 5 | **IA Agente 1** | Groq `llama-4-scout-17b` | Extração bruta. `temperature=0.0`. Chain-of-Thought para datas. |
+| 6 | **IA Agente 2** | Groq `llama-4-scout-17b` | Categorização com regras de desambiguação. `temperature=0.1`. |
+| 7 | **Dashboard AP/AR** | Telegram Inline UI | Acordeon de faturas, modo isolado, diferenciação Receita/Despesa |
+| 8 | **Extrato** | Telegram Inline UI | Saldo benefício, índice de parcela, regime de caixa |
+| 9 | **Motor de Pagamento** | `database.py` | Antecipação, regime de caixa, sobrescrita de método |
+| 10 | **Banco de Dados** | PostgreSQL | Livro Caixa AP/AR com SCD e queries CTE |
 
 ---
 
-### 3. Requisitos Funcionais (RFs)
+### 3–8.
 
-* **RF01 — Ingestão Multimodal:** Texto livre, URLs NFC-e e PDFs.
-* **RF02 — Extração por IA e Roteamento:** Pipeline dual para extração e classificação em `RECEITA`/`DESPESA`.
-* **RF03 — Detecção de Desconto Oculto:** Se a soma dos itens exceder o total da nota, a diferença é registrada automaticamente como desconto.
-* **RF04 — Cálculo de Parcelas:** Motor customizado com regras de fechamento/vencimento de cartão brasileiro.
-* **RF05 — Confirmação Human-in-the-Loop:** Resumo Markdown antes de qualquer escrita no banco.
-* **RF06 — Dashboard AP/AR (`/contas`):** Faturas agrupadas por cartão, diferenciação visual Receita/Despesa (🟢/🟡 vs 🔹/🔴), alertas de vencimento, navegação temporal, Modo Isolado, escape hatches.
-* **RF07 — Pagamento Individual:** Parcela avulsa com suporte a desconto por antecipação.
-* **RF08 — Pagamento em Grupo (Regime de Caixa):** Paga toda a fatura de um cartão; atualiza o campo `month` para o mês do pagamento real.
-* **RF09 — Cancelamento de Parcela:** Soft-delete para conciliação bancária sem afetar outros meses.
-* **RF10 — Modo Isolado:** Filtrar o painel para a linha do tempo de uma única transação.
-* **RF11 — Extrato de Fluxo de Caixa (`/extrato`):** Saldo Atual e Projetado. Separação Carteira Principal vs Carteira Benefício. Lista de lançamentos com índice de parcela dinâmico (`8/10`), marcador `*` para pendências. Navegação mensal.
-* **RF12 — Detecção de Duplicatas:** Match exato de `numero_nota` + match fuzzy por local/valor/data.
-* **RF13 — Gestão de Cartões:** Cadastro mid-flow com regras de fechamento/vencimento.
+Os Requisitos Funcionais, RNFs, Decisões Arquiteturais, Schema e Segurança seguem a mesma estrutura da versão em inglês acima. Destaques para o contexto brasileiro:
 
----
+**Decisão 5.4 — Antecipação de Cartão vs. Pagamento à Vista:**
+Pagar antecipado num cartão de crédito move a parcela para o ciclo de fatura alvo (permanece PENDENTE). Isso modela o comportamento real — pagar antes do fechamento não quita a dívida, muda para a próxima fatura. Pagamentos à vista marcam PAGO e realocam `month` para o mês do pagamento real (Regime de Caixa).
 
-### 4. Requisitos Não Funcionais (RNFs)
-
-* **RNF01 — Resiliência (Outbox):** Nenhuma mensagem perdida por indisponibilidade da API.
-* **RNF02 — Backoff Exponencial:** Erros genéricos: 60s–3600s. Limite TPD: adiar para 09:00 do dia seguinte.
-* **RNF03 — Prevenção de Itens Zumbi:** `max_attempts` com status `DEAD`.
-* **RNF04 — Adiamento por Estado Ocupado:** `reschedule_queue_item_busy` sem consumir tentativa.
-* **RNF05 — Pool de Conexões:** `ThreadedConnectionPool` (1–10).
-* **RNF06 — Parsing Tolerante a Falhas:** Limpa alucinações do LLM antes do parsing.
-* **RNF07 — Validação Matemática:** Recalcula totais; detecta descontos ocultos via comparação de soma de itens.
-* **RNF08 — Controle de Acesso:** Whitelist `ALLOWED_CHAT_IDS` via decorator `security_check`.
-* **RNF09 — Segurança Stateless:** Segredos apenas via variáveis de ambiente.
-* **RNF10 — Auditabilidade (SCD):** `created_at`/`updated_at` em todas as tabelas.
-* **RNF11 — Distribuição Proporcional de Desconto:** Desconto de grupo distribuído proporcionalmente entre as parcelas.
-* **RNF12 — Regime de Caixa:** Campo `month` atualizado para o mês do pagamento real ao baixar fatura agrupada.
-* **RNF13 — Indexação Dinâmica de Parcelas:** CTE com `ROW_NUMBER()` recalcula o índice em tempo de query, resistente a atualizações do campo `month`.
-
----
-
-### 5. Decisões Arquiteturais: O "Por Quê?"
-
-#### 5.1. Pipeline Dual de LLM
-Responsabilidades cognitivas isoladas. Temperaturas calibradas por tarefa. Chain-of-Thought para datas.
-
-#### 5.2. Padrão Outbox Transacional
-Entrega garantida. UX instantânea (< 100ms). `FOR UPDATE SKIP LOCKED` para concorrência segura.
-
-#### 5.3. Motor de Parcelas Customizado
-Regras de faturamento de cartão brasileiro (fechamento/vencimento) não são modeladas por bibliotecas padrão.
-
-#### 5.4. Por que Regime de Caixa no `/extrato`?
-**Decisão:** Ao pagar uma fatura em grupo, o campo `month` das parcelas é atualizado para o mês do pagamento.
-**Justificativa:** O extrato reflete a realidade. No regime de caixa, uma compra de abril que vence em junho aparece em junho, quando o dinheiro saiu de fato. Isso corresponde ao extrato bancário real. O painel `/contas` preserva as datas originais para gestão; o `/extrato` usa o mês de caixa para relatórios.
-
-#### 5.5. Por que separar a Carteira Benefício?
-Benefícios (VA/VR) não são fungíveis com dinheiro. Misturar os saldos daria uma visão distorcida do caixa disponível real.
-
-#### 5.6. Por que CTE com `ROW_NUMBER()` para índice de parcelas?
-O número da parcela deve sobreviver às atualizações do campo `month` pelo regime de caixa. `ROW_NUMBER() OVER (PARTITION BY transaction_id ORDER BY id ASC)` recalcula o índice a partir do `id` imutável, sempre retornando "8 de 10" corretamente.
-
-#### 5.7. Por que agrupar parcelas por cartão na UI?
-As pessoas pagam faturas, não compras individuais. A visão agrupada espelha o comportamento real dos bancos.
-
-#### 5.8. Por que PostgreSQL?
-1 transação → N itens → N parcelas. Integridade referencial, colunas tipadas e decimais agregáveis são ativos aqui, não passivos.
-
----
-
-### 6. Schema do Banco de Dados
-
-```
-credit_cards
-    id, bank, variant, closing_day, due_day
-
-process_queue
-    id, chat_id, received_text, is_pdf, status, attempts, max_attempts, next_attempt
-
-transactions  ←──────────────────────────────────────────────┐
-    id, transaction_type, invoice_number                      │ FK
-    transaction_date (DATE), location_name                    │
-    card_bank, card_variant, status [Ativa | PAID]            │
-    original_amount, discount_applied, total_amount           │
-    macro_category, payment_method                            │
-    is_installment, installment_count                         │
-                                                              │
-transaction_items  ──── transaction_id (FK) ──────────────────┤
-    description, brand, unit_price, quantity                  │
-    cat_macro, cat_category, cat_subcategory                  │
-                                                              │
-installments  ───────── transaction_id (FK) ──────────────────┘
-    month (MM/AAAA)  ← atualizado para o mês do pagamento real (regime de caixa)
-    due_date (DATE)  ← data original preservada para cálculo de vencimento
-    amount, payment_status [PENDING | PAID | CANCELED]
-    payment_date (DATE), paid_amount
-```
-
-**Nota importante:** `month` e `due_date` podem divergir após pagamento em grupo. `due_date` é sempre a data contratual original; `month` reflete quando o dinheiro se moveu. O `/extrato` filtra por `month`; o `/contas` usa `due_date` para cálculo de vencimento.
-
----
-
-### 7. Estratégia de Segurança
-
-- **Segredos Desacoplados:** `.env` local, painel de Variables do Railway em produção.
-- **Controle de Acesso:** Whitelist `ALLOWED_CHAT_IDS` via decorator `security_check` em todos os handlers.
-- **Design Stateless:** PDFs deletados em blocos `finally`. Nenhum estado sensível em disco.
-- **Prevenção de SQL Injection:** Todas as queries usam `%s` parametrizado.
+**Decisão 5.6 — `month` vs. `due_date`:**
+`due_date` é imutável (data contratual). Usada pelo `/contas` para cálculo de vencimento. `month` é mutável (atualizado pelo regime de caixa). Usado pelo `/extrato` para relatórios financeiros. Os dois campos divergem intencionalmente após o pagamento.
