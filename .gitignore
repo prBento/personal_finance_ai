@@ -4,6 +4,7 @@ env/
 
 # Arquivos de Senha
 .env
+sync_db.ps1
 
 # Cache do Python
 __pycache__/
@@ -11,3 +12,7 @@ __pycache__/
 
 # Arquivos de controle
 ROADMAP_V1_V2.md
+
+# Backups de Banco de Dados
+*.sql
+bkp_zotto.sql
