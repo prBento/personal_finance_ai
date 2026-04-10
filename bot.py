@@ -508,31 +508,34 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str, filter_tx_id: int = None):
     """
-    Renders the interactive AP Dashboard.
-    If 'filter_tx_id' is provided, it enters "Isolated View".
-    Visually differentiates Incomes (Receitas) from Expenses (Despesas).
+    Renders the interactive AP Dashboard with Progressive Disclosure (Summary vs Detailed).
+    Added contextual pending values (Total Expected vs Total Pending).
     """
     bills = get_pending_bills_by_month(target_month)
     
-    # Isolation Filter
+    view_mode = context.user_data.get(f"view_mode_{target_month}", "summary")
+    if filter_tx_id: view_mode = "detailed"
+
+    def fmt_money(val):
+        return f"{val:,.2f}".replace(',', 'v').replace('.', ',').replace('v', '.')
+
+    text = f"🗓️ *Painel de Contas — {target_month}*\n"
+    
     if filter_tx_id:
         bills = [b for b in bills if b.get('transaction_id') == filter_tx_id]
-        overdue_other = [] # Hides global warnings in isolated view
-        text = f"🔍 *Modo Isolado - {target_month}*\nVisualizando apenas parcelas desta transação:\n"
+        overdue_other = []
+        text += f"🔍 _Modo Isolado (Transação {filter_tx_id})_\n"
     else:
         overdue_all = get_all_overdue_installments()
         overdue_other = [b for b in overdue_all if b['month'] != target_month]
-        text = f"🗓️ *Painel de Pendências - {target_month}*\n"
         if overdue_other:
-            text += f"\n🚨 *ATENÇÃO:* Você tem {len(overdue_other)} pendências *VENCIDAS* em outros meses!\n"
+            text += f"\n🚨 *ATENÇÃO:* {len(overdue_other)} pendências *VENCIDAS* em outros meses!\n"
 
     keyboard = []
+    
     if not bills:
         text += "\n🎉 Nenhuma pendência para este mês!"
     else:
-        if not filter_tx_id:
-            text += "\nSelecione um item para gerenciar:\n"
-        
         grouped_cards = {}
         standalone_bills = []
         
@@ -540,10 +543,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             if b['bank']:
                 group_key = f"{b['bank']}_{b['variant']}" if b['variant'] else b['bank']
                 if group_key not in grouped_cards:
-                    grouped_cards[group_key] = {
-                        "bank": b['bank'], "variant": b['variant'], 
-                        "total_amount": 0.0, "items": [], "due_date": b['due_date'], "is_overdue": False
-                    }
+                    grouped_cards[group_key] = {"bank": b['bank'], "variant": b['variant'], "total_amount": 0.0, "items": [], "is_overdue": False}
                 grouped_cards[group_key]["total_amount"] += b['amount']
                 grouped_cards[group_key]["items"].append(b)
                 if b['is_overdue']: grouped_cards[group_key]["is_overdue"] = True
@@ -552,72 +552,107 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 
         expanded_groups = context.user_data.setdefault(f"expanded_{target_month}", {})
         
-        # Render Grouped Cards (Credit cards are always expenses)
-        for key, card in grouped_cards.items():
-            is_expanded = expanded_groups.get(key, False) # Verifica se deve mostrar os filhos
+        # SÓ RENDERIZA O HEADER MONOSPACE SE ESTIVER NA VISÃO RESUMIDA
+        if view_mode == "summary":
+            # Busca todas as transações do mês (Pagas e Pendentes) para fazer a matemática
+            all_tx = get_cash_flow_by_month(target_month)
             
-            icon_alert = "🔴" if card['is_overdue'] else "💳"
-            toggle_icon = "⏷" if is_expanded else "⏵"
+            total_despesas = sum(t['expected_amount'] for t in all_tx if t['type'] == 'DESPESA')
+            pend_despesas = sum(t['expected_amount'] for t in all_tx if t['type'] == 'DESPESA' and t['status'] == 'PENDING')
             
-            v_tag = f" {card['variant']}" if card['variant'] else ""
-            display_name = f"{card['bank']}{v_tag}"
-            safe_var = card['variant'] if card['variant'] else "none"
+            total_receitas = sum(t['expected_amount'] for t in all_tx if t['type'] == 'RECEITA')
+            pend_receitas = sum(t['expected_amount'] for t in all_tx if t['type'] == 'RECEITA' and t['status'] == 'PENDING')
             
-            # O botão principal agora serve para expandir/encolher (toggle)
-            parent_text = f"{toggle_icon} {icon_alert} {display_name} - R$ {card['total_amount']:.2f}"
-            keyboard.append([InlineKeyboardButton(parent_text, callback_data=f"toggle_{card['bank']}_{safe_var}_{target_month}")])
-            
-            # Só desenha os botões de baixo SE o acordeon estiver aberto
-            if is_expanded:
-                # O botão de pagar a fatura fechada fica aqui dentro como primeira opção
-                keyboard.append([InlineKeyboardButton("   💸 Pagar Fatura Fechada", callback_data=f"fatgroup_{card['bank']}_{safe_var}_{target_month}")])
-                
-                # Renderiza os itens individuais
-                for item in card['items']:
-                    item_icon = "🔴" if item['is_overdue'] else "🔸"
-                    child_text = f"   ↳ {item_icon} {item['location'][:12]} - R$ {item['amount']:.2f}"
-                    keyboard.append([InlineKeyboardButton(child_text, callback_data=f"fatura_{item['id']}_{target_month}")])
+            str_desp = f"{fmt_money(total_despesas)} ({fmt_money(pend_despesas)}*)"
+            str_rec = f"{fmt_money(total_receitas)} ({fmt_money(pend_receitas)}*)"
 
-        # Render Standalone Bills (Can be Income or Expense)
-        for b in standalone_bills:
-            is_income = b.get('type', 'DESPESA') == 'RECEITA'
+            text += "```text\n"
+            text += f"A PAGAR..: {str_desp}\n"
+            text += f"A RECEBER: {str_rec}\n\n"
             
-            if is_income:
-                icon = "🟡" if b['is_overdue'] else "🟢"
-                sign = "+"
-            else:
-                icon = "🔴" if b['is_overdue'] else "🔹"
-                sign = ""
-                
-            btn_text = f"{icon} {b['location'][:14]} {sign}R$ {b['amount']:.2f} ({b['due_date'][:5]})"
-            keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"fatura_{b['id']}_{target_month}")])
+            for key, card in grouped_cards.items():
+                name = f"💳 {card['bank']} {card['variant']}".strip()[:18]
+                name_padded = f"{name:.<20}"
+                val_str = f"(R$ {fmt_money(card['total_amount'])})"
+                text += f"{name_padded} {val_str:>13}\n"
 
+            for b in standalone_bills:
+                is_income = b.get('type', 'DESPESA') == 'RECEITA'
+                icon = "💰" if is_income else "💸"
+                name = f"{icon} {b['location'][:16]}".strip()
+                name_padded = f"{name:.<20}"
+                val_fmt = f"R$ {fmt_money(b['amount'])}"
+                val_str = f" +{val_fmt}" if is_income else f"({val_fmt})"
+                text += f"{name_padded} {val_str:>13}\n"
+                
+            text += "```\n"
+            text += "_(*) Valor Pendente_\n"
+        else:
+            text += "\n👇 *Selecione uma conta abaixo para gerenciar:*\n"
+
+    # ==========================================
+    # LÓGICA DE BOTÕES
+    # ==========================================
     target_dt = datetime.strptime(target_month, "%m/%Y")
     prev_month = (target_dt - relativedelta(months=1)).strftime("%m/%Y")
     next_month = (target_dt + relativedelta(months=1)).strftime("%m/%Y")
-
-    # Navigation logic
     tx_param = f"_tx_{filter_tx_id}" if filter_tx_id else ""
-    nav_row = [
-        InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}{tx_param}"),
-        InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"mes_{next_month}{tx_param}")
-    ]
-    keyboard.append(nav_row)
     
-    # Contextual controls
+    if view_mode == "summary" and bills:
+        nav_row = [
+            InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}{tx_param}"),
+            InlineKeyboardButton("🔍 Ver Detalhes", callback_data=f"view_detailed_{target_month}{tx_param}"),
+            InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"mes_{next_month}{tx_param}")
+        ]
+        keyboard.append(nav_row)
+    else:
+        if bills and not filter_tx_id:
+            keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Resumo", callback_data=f"view_summary_{target_month}{tx_param}")])
+            
+        if bills:
+            for key, card in grouped_cards.items():
+                is_expanded = expanded_groups.get(key, False)
+                icon_alert = "🔴" if card['is_overdue'] else "💳"
+                toggle_icon = "⬆️" if is_expanded else "⬇️"
+                
+                v_tag = f" {card['variant']}" if card['variant'] else ""
+                display_name = f"{card['bank']}{v_tag}"
+                safe_var = card['variant'] if card['variant'] else "none"
+                
+                parent_text = f"{icon_alert} {display_name} | R$ {fmt_money(card['total_amount'])} {toggle_icon}"
+                keyboard.append([InlineKeyboardButton(parent_text, callback_data=f"toggle_{card['bank']}_{safe_var}_{target_month}")])
+                
+                if is_expanded:
+                    keyboard.append([InlineKeyboardButton("   💸 Pagar Fatura Fechada", callback_data=f"fatgroup_{card['bank']}_{safe_var}_{target_month}")])
+                    for item in card['items']:
+                        item_icon = "🔴" if item['is_overdue'] else "🔸"
+                        child_text = f"   ↳ {item_icon} {item['location'][:12]} | R$ {fmt_money(item['amount'])}"
+                        keyboard.append([InlineKeyboardButton(child_text, callback_data=f"fatura_{item['id']}_{target_month}")])
+
+            for b in standalone_bills:
+                is_income = b.get('type', 'DESPESA') == 'RECEITA'
+                icon = "🟡" if b['is_overdue'] and is_income else "💰" if is_income else "🔴" if b['is_overdue'] else "💸"
+                sign = "+" if is_income else ""
+                btn_text = f"{icon} {b['location'][:14]} | {sign}R$ {fmt_money(b['amount'])}"
+                keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"fatura_{b['id']}_{target_month}")])
+
+        nav_row = [
+            InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}{tx_param}"),
+            InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"mes_{next_month}{tx_param}")
+        ]
+        keyboard.append(nav_row)
+
     if filter_tx_id:
-        keyboard.append([InlineKeyboardButton("⬅️ Voltar à Visão Geral", callback_data=f"mes_{target_month}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Sair do Modo Isolado", callback_data=f"mes_{target_month}")])
     else:
         max_month = get_max_pending_month()
-        if max_month and max_month != target_month and datetime.strptime(max_month, "%m/%Y") > target_dt:
+        if max_month and max_month != target_month and datetime.strptime(max_month, "%m/%Y") > datetime.strptime(target_month, "%m/%Y"):
             keyboard.append([InlineKeyboardButton(f"⏭️ Pular para Último Mês ({max_month})", callback_data=f"mes_{max_month}")])
 
-    # Feature: Return to Current Month (Appears if user is time-traveling)
     current_month_str = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
     if target_month != current_month_str:
-        keyboard.append([InlineKeyboardButton(f"📅 Voltar para Mês Atual ({current_month_str})", callback_data=f"mes_{current_month_str}{tx_param}")])
+        keyboard.append([InlineKeyboardButton(f"📅 Voltar para Mês Atual", callback_data=f"mes_{current_month_str}{tx_param}")])
         
-    # Global Escape Hatch (Only in main view)
     if not filter_tx_id:
         keyboard.append([InlineKeyboardButton("❌ Fechar Painel", callback_data="close_panel")])
 
@@ -668,8 +703,7 @@ async def ask_for_payment_amount(bot, chat_id, query, target_month, pay_date, bi
 async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str):
     """
     Renders the Financial Ledger (Extrato) on Telegram.
-    Now includes a visual tag [B] in the monospace list to explicitly show 
-    which items were successfully isolated into the Benefit Balance.
+    Clean UI: Removed heavy line separators in favor of double spacing.
     """
     transactions = get_cash_flow_by_month(target_month)
     
@@ -680,11 +714,10 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     ben_tx = []
     
     for t in transactions:
-        # Junta todas as colunas que podem conter a palavra chave
         m = f"{t.get('method', '')} {t.get('bank', '')} {t.get('variant', '')}".lower()
         if "benefício" in m or "beneficio" in m or "pré-pago" in m or "pre-pago" in m or "vr" in m or "va" in m or "caju" in m:
             ben_tx.append(t)
-            t['is_benefit'] = True # Flag para a interface
+            t['is_benefit'] = True
         else:
             main_tx.append(t)
             t['is_benefit'] = False
@@ -709,7 +742,8 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     if ben_tx:
         text += f"\n🎫 *Saldo Benefício:* R$ {fmt_money(ben_saldo_atual)}\n"
 
-    text += "\n─────────────────\n"
+    # Substituição da linha pesada por \n\n
+    text += "\n\n"
     text += f"💵 *Receitas*\n"
     text += f"  Realizado: R$ {fmt_money(rec_pagas)}\n"
     text += f"  Previsto:  R$ {fmt_money(rec_prev)}\n\n"
@@ -718,7 +752,8 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     text += f"  Realizado: R$ {fmt_money(desp_pagas)}\n"
     text += f"  Previsto:  R$ {fmt_money(desp_prev)}\n"
     
-    text += "─────────────────\n"
+    # Substituição da linha pesada por \n\n
+    text += "\n\n"
     text += "📋 *Últimos Lançamentos*\n"
     
     if not transactions:
@@ -737,10 +772,7 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
             amt_str = f"{amt_formatted}" if is_income else f"({amt_formatted})"
             
             loc_raw = t['location'].strip().title()
-            
-            # --- TAG VISUAL DE BENEFÍCIO ---
-            if t.get('is_benefit'):
-                loc_raw = f"[B] {loc_raw}"
+            if t.get('is_benefit'): loc_raw = f"[B] {loc_raw}"
             
             if t.get('is_installment') and t.get('installment_count', 1) > 1:
                 parcel_str = f" {t['inst_num']}/{t['installment_count']}"
@@ -750,15 +782,11 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
                 loc = loc_raw[:14]
             
             tag = " " if is_paid else "*"
-            
             line = f"{loc:<14} {date_str} - {amt_str:>10} {tag}"
             text += line + "\n"
 
         text += "```\n"
-
-        if len(transactions) > 30:
-            text += f"_...e mais {len(transactions) - 30} transações._\n"
-            
+        if len(transactions) > 30: text += f"_...e mais {len(transactions) - 30} transações._\n"
         text += "_( * ) = Lançamento Previsto/Pendente_\n"
 
     target_dt = datetime.strptime(target_month, "%m/%Y")
@@ -769,7 +797,6 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
         InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"extmes_{prev_month}"),
         InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"extmes_{next_month}")
     ]
-    
     keyboard = [nav_row]
     
     current_month_str = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
@@ -779,10 +806,8 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard.append([InlineKeyboardButton("❌ Fechar Extrato", callback_data="close_panel")])
     markup = InlineKeyboardMarkup(keyboard)
 
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
-    else:
-        await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+    if update.callback_query: await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+    else: await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 @security_check
 async def extrato_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -830,6 +855,16 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         
         # Chama a função para desenhar a tela novamente com o novo estado
         await show_bills_month(update, context, target_month)
+    
+    elif data.startswith("view_"):
+        # Gatilho de mudança entre Summary e Detailed
+        parts = data.split("_")
+        mode = parts[1] # "summary" ou "detailed"
+        target_month = parts[2]
+        filter_tx_id = int(parts[4]) if len(parts) > 4 and parts[3] == "tx" else None
+        
+        context.user_data[f"view_mode_{target_month}"] = mode
+        await show_bills_month(update, context, target_month, filter_tx_id=filter_tx_id)
     
     elif data == "help_main":
         await help_command(update, context)
