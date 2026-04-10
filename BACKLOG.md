@@ -39,6 +39,7 @@
 - [ ] **FIX-01 (Benefit Detection):** Add `card_bank` and `card_variant` columns to `get_cash_flow_by_month` query so benefit wallet isolation works for transactions where the method field alone doesn't identify VA/VR.
 - [ ] **PROD-04 (Async DB):** Replace `psycopg2` with `asyncpg` to stop blocking the FastAPI/Telegram event loop on database calls.
 
+
 ---
 
 ## 🇧🇷 Versão em Português Brasileiro
@@ -72,3 +73,4 @@
 - [ ] **BACK-03:** Descriptografar PDF com senha via chat.
 - [ ] **FIX-01:** Adicionar `card_bank`/`card_variant` na query `get_cash_flow_by_month` para detecção correta de benefício.
 - [ ] **PROD-04:** Substituir `psycopg2` por `asyncpg` para não bloquear o event loop do FastAPI.
+- [ ] **DEBT-04 (Padrão ASGI):** Mover a inicialização do banco (`create_tables()`) do bloco `__main__` para dentro do `@asynccontextmanager lifespan` do FastAPI. Isso permitirá alterar o Procfile para `web: uvicorn bot:api` no futuro, habilitando o uso de múltiplos *workers* de processamento no Uvicorn.
