@@ -7,6 +7,7 @@ import asyncio
 import random
 from datetime import datetime, timezone, timedelta
 from dateutil.relativedelta import relativedelta
+import unicodedata
 
 import requests
 from bs4 import BeautifulSoup
@@ -58,6 +59,16 @@ def security_check(func):
             return
         return await func(update, context)
     return wrapper
+
+def normalize_text(text):
+    if not text: return ""
+    text = str(text).strip()
+    # 1. Remove os acentos matematicamente separando a letra do sinal diacrítico
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
+    # 2. Remove qualquer coisa que não seja letra, número ou espaço (ex: emojis, traços)
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
+    # 3. Remove espaços duplicados no meio da frase e padroniza a capitalização
+    return " ".join(text.split()).title()
 
 def extract_text_from_url(url):
     """Web scraping fallback. If the user sends a URL (like an NFC-e link), it fetches the HTML and extracts raw text."""
@@ -346,8 +357,8 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     tx_type = str(tx.get("tipo_transacao", "DESPESA")).upper()
     method = str(tx.get("metodo_pagamento")).lower() if tx.get("metodo_pagamento") else "desconhecido"
     
-    bank = tx.get("cartao", {}).get("banco")
-    variant = tx.get("cartao", {}).get("variante")
+    bank = normalize_text(tx.get("cartao", {}).get("banco"))
+    variant = normalize_text(tx.get("cartao", {}).get("variante"))
 
     clean_words = ["null", "none", "não informado", "nao informado", "desconhecido", ""]
     if bank and str(bank).strip().lower() in clean_words: bank = None
@@ -1151,8 +1162,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
                 
             parts = ans.split(" ", 1)
-            context.user_data["baixa_new_bank"] = parts[0]
-            context.user_data["baixa_new_variant"] = parts[1] if len(parts) > 1 else ""
+            context.user_data["baixa_new_bank"] = normalize_text(parts[0])
+            context.user_data["baixa_new_variant"] = normalize_text(parts[1]) if len(parts) > 1 else ""
             
             context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
             bill_id = context.user_data["parcela_pagamento_id"]
@@ -1285,8 +1296,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # FSM: Adding Transaction -> Upserting a new card (Name)
         if state == "AGUARDANDO_NOME_NOVO_CARTAO":
             parts = update.message.text.split(" ", 1)
-            context.user_data.update({"pendente_banco": parts[0], "pendente_variante": parts[1] if len(parts) > 1 else "", "estado": "AGUARDANDO_DATAS_CARTAO"})
-            context.user_data["transacao_pendente_json"]["transacoes"][0]["cartao"] = {"banco": context.user_data["pendente_banco"], "variante": context.user_data["pendente_variante"]}
+            banco_norm = normalize_text(parts[0])
+            var_norm = normalize_text(parts[1]) if len(parts) > 1 else ""
+
+            context.user_data.update({"pendente_banco": banco_norm, "pendente_variante": var_norm, "estado": "AGUARDANDO_DATAS_CARTAO"})
+            context.user_data["transacao_pendente_json"]["transacoes"][0]["cartao"] = {"banco": banco_norm, "variante": var_norm}
             await update.message.reply_text(f"Fechamento e vencimento? (Ex: 1 e 8)")
             return
 
