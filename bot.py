@@ -13,7 +13,7 @@ import requests
 from bs4 import BeautifulSoup
 from pypdf import PdfReader
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from groq import AsyncGroq
 from contextlib import asynccontextmanager
@@ -1436,6 +1436,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Olá! Mande seus gastos ou PDFs de contas para análise.")
 
+
+@security_check
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Abre o Streamlit dentro do próprio Telegram usando o recurso de Web App (Mini App).
+    """
+    # Puxa a URL do .env. Se não tiver, avisa o usuário.
+    dashboard_url = os.getenv("DASHBOARD_URL")
+    
+    if not dashboard_url:
+        await update.message.reply_text("❌ A variável `DASHBOARD_URL` não está configurada no servidor.", parse_mode="Markdown")
+        return
+
+    # O segredo está aqui: o parâmetro web_app
+    keyboard = [
+        [InlineKeyboardButton(text="📊 Abrir Zotto BI", web_app=WebAppInfo(url=dashboard_url))]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "📈 *Seu Dashboard de Inteligência Financeira está pronto.*\n\n"
+        "Clique no botão abaixo para abrir sem sair do Telegram:", 
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+
 @security_check
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
@@ -1482,6 +1508,7 @@ telegram_app.add_handler(CommandHandler("cancelar", cancel_command))
 telegram_app.add_handler(CommandHandler("contas", list_pending_bills))
 telegram_app.add_handler(CommandHandler("extrato", extrato_command))
 telegram_app.add_handler(CommandHandler("help", help_command))
+telegram_app.add_handler(CommandHandler("dash", dashboard_command))
 telegram_app.add_handler(CallbackQueryHandler(handle_inline_button)) 
 telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
