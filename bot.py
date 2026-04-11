@@ -30,23 +30,32 @@ from database import (
 
 from prompts import PROMPT_AGENTE_1, PROMPT_AGENTE_2
 
+# ==============================================================================
 # --- Environment & Configuration ---
+# ==============================================================================
 ENV = os.getenv("ENVIRONMENT", "dev").lower()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN_PROD") if ENV == "prod" else os.getenv("TELEGRAM_TOKEN_DEV")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY_PROD") if ENV == "prod" else os.getenv("GROQ_API_KEY_DEV")
 
-# Whitelist: Only these Telegram User IDs can interact with the bot. Essential for personal finance security.
+# Whitelist: Only these Telegram User IDs can interact with the bot. 
+# Essential for personal finance security to prevent unauthorized data injection.
 ALLOWED_CHAT_IDS = [int(x.strip()) for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",") if x.strip()]
 
-# Asynchronous LLM Client
+# Asynchronous LLM Client (Groq)
 groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
-# Global State Managers
-# TEMP_SESSION holds the parsed JSON temporarily while the bot asks the user for missing info.
+# ==============================================================================
+# --- Global State Managers (In-Memory) ---
+# ==============================================================================
+
+# TEMP_SESSION holds the parsed JSON temporarily while the bot asks the user for missing info via Telegram FSM.
 TEMP_SESSION = {}
-# ACTIVE_CHATS prevents the background queue from interrupting a user who is actively answering a questionnaire.
+# ACTIVE_CHATS prevents the background worker queue from interrupting a user who is actively answering a questionnaire.
 ACTIVE_CHATS = set()
 
+# ==============================================================================
+# --- Utility Functions ---
+# ==============================================================================
 
 def security_check(func):
     """
@@ -61,17 +70,26 @@ def security_check(func):
     return wrapper
 
 def normalize_text(text):
+    """
+        Sanitizes strings to prevent UI bugs and database duplication (Mojibake prevention).
+        - Removes accents (e.g., 'Itaú' -> 'Itau').
+        - Removes special characters and emojis.
+        - Standardizes capitalization (Title Case).
+    """
     if not text: return ""
     text = str(text).strip()
-    # 1. Remove os acentos matematicamente separando a letra do sinal diacrítico
+    # 1. Mathematically separates the letter from the diacritic mark (accent)
     text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
-    # 2. Remove qualquer coisa que não seja letra, número ou espaço (ex: emojis, traços)
+    # 2. Removes anything that is not a letter, number, or space
     text = re.sub(r'[^a-zA-Z0-9\s]', '', text)
-    # 3. Remove espaços duplicados no meio da frase e padroniza a capitalização
+    # 3. Removes duplicated spaces and standardizes to Title Case
     return " ".join(text.split()).title()
 
 def extract_text_from_url(url):
-    """Web scraping fallback. If the user sends a URL (like an NFC-e link), it fetches the HTML and extracts raw text."""
+    """
+    Web scraping fallback. If the user sends a URL (like an NFC-e link), 
+    it fetches the HTML, strips scripts/styles, and extracts raw text for the LLM.
+    """
     try:
         response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=10)
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -82,16 +100,22 @@ def extract_text_from_url(url):
 def extract_json_from_response(raw_text):
     """
     LLM outputs often contain conversational fluff (e.g., "Here is your JSON: ```json ... ```").
-    This regex forces the extraction of ONLY the JSON block, cleaning up common formatting errors.
+    This regex forces the extraction of ONLY the JSON block, cleaning up common formatting errors (booleans/nulls).
     """
     match = re.search(r'\{[\s\S]*\}', raw_text)
     if not match: return None
     json_text = match.group(0)
+    # Strip inline comments the LLM might hallucinate
     json_text = re.sub(r'(?<![:"\/])\/\/.*', '', json_text)
+     # Standardize Python/JSON booleans and nulls
     json_text = json_text.replace(": False", ": false").replace(": True", ": true").replace(": None", ": null")
     json_text = json_text.replace(":False", ":false").replace(":True", ":true").replace(":None", ":null")
     try: return json.loads(json_text, strict=False)
     except: return None
+
+# ==============================================================================
+# --- Core Financial Engines ---
+# ==============================================================================
 
 def calculate_invoice_due_date(purchase_date, closing_day, due_day):
     """
@@ -134,21 +158,22 @@ def generate_installment_details(total_amount, total_installments, transaction_d
         except: 
             base_date = tx_date
     elif card_rules and closing == 0 and due == 0: 
-        base_date = tx_date
+        base_date = tx_date # Prepaid cards process immediately
     elif "crédito" in method_str or "credito" in method_str:
         if card_rules: base_date = calculate_invoice_due_date(tx_date, closing, due)
         else: base_date = tx_date + relativedelta(months=1)
     else: 
         base_date = tx_date
 
+    # Identify if payment clears immediately (Cash Basis)
     cash_keywords = ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança", "benefício", "pré-pago"]
     is_cash_payment = any(word in method_str for word in cash_keywords)
     
     payment_status = "PAID" if (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str else "PENDING"
     
-    # --- NOVA LÓGICA: REALOCAÇÃO DE REGIME DE CAIXA (PAGAMENTO ANTECIPADO) ---
+    # --- CASH BASIS REALLOCATION LOGIC ---
     if payment_status == "PAID":
-        # Se a data de vencimento extraída for no futuro, mas foi pago HOJE, a data real é hoje.
+        # If paid today, but the extracted invoice date is in the future, lock the real payment date to today.
         if tx_date > today_dt:
             real_pay_date = today_dt
         else:
@@ -162,10 +187,11 @@ def generate_installment_details(total_amount, total_installments, transaction_d
 
     paid_value = installment_value if payment_status == "PAID" else 0.0
 
+    # Generate the payload for PostgreSQL insertion
     for i in range(actual_installments):
         installment_date = base_date + relativedelta(months=i)
         
-        # Se foi pago, força o mês da parcela a ser o mês do pagamento real para bater com o Extrato
+        # If Paid, force the installment month to match the real payment month to align with the Cash Flow Ledger (Extrato)
         assigned_month = base_payment_month if payment_status == "PAID" else installment_date.strftime("%m/%Y")
         
         details.append({
@@ -175,6 +201,10 @@ def generate_installment_details(total_amount, total_installments, transaction_d
             "dt_pagamento": date_paid_str, "valor_pago": paid_value
         })
     return details
+
+# ==============================================================================
+# --- Background Workers & Orchestrators ---
+# ==============================================================================
 
 async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
     """
@@ -208,7 +238,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         prompt_1 = PROMPT_AGENTE_1.replace("[DATA_ATUAL]", today_str)
         prompt_2 = PROMPT_AGENTE_2.replace("[DATA_ATUAL]", today_str)
         
-        # LLM Call 1: Extraction
+        # LLM Call 1: Data Extraction (Transforms raw text/receipts into structural JSON)
         chat_ext = await groq_client.chat.completions.create(
             messages=[{"role": "system", "content": prompt_1}, {"role": "user", "content": text_to_process}],
             model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0.0, max_tokens=8000
@@ -216,7 +246,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         json_ext = extract_json_from_response(chat_ext.choices[0].message.content)
         if not json_ext: raise Exception("Falha na Estruturação.")
 
-        # LLM Call 2: Enrichment
+        # LLM Call 2: Enrichment (Categorizes the extracted data based on historical rules)
         chat_enr = await groq_client.chat.completions.create(
             messages=[{"role": "system", "content": prompt_2}, {"role": "user", "content": json.dumps(json_ext, ensure_ascii=False)}],
             model="meta-llama/llama-4-scout-17b-16e-instruct", temperature=0.1, max_tokens=8000
@@ -224,24 +254,27 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
         final_json = extract_json_from_response(chat_enr.choices[0].message.content)
         if not final_json: raise Exception("Falha na Categorização.")
 
-        # Pre-Processing and Idempotency Checks before asking the user
+        # --- Pre-Processing and Idempotency Checks ---
         for tx in final_json.get("transacoes", []):
             inv_num = tx.get("numero_nota")
             
-            # Check 1: Exact invoice duplicate
+            # Check 1: Exact invoice ID duplicate prevention
             if inv_num and str(inv_num).lower() != "null":
                 if check_existing_invoice(inv_num):
                     await context.bot.send_message(chat_id, f"🚫 *Duplicado!* A nota `{inv_num}` já foi enviada.", parse_mode="Markdown")
                     complete_queue_item(item['id'])
                     return
             else:
+                # Assigns a mock ID for receiptless transactions
                 tx["numero_nota"] = f"M-{random.randint(100000000, 999999999)}"
                 loc_check = str(tx.get("local_compra", {}).get("nome", "DESCONHECIDO")).upper()
+                
                 # Check 2: Heuristic duplicate (Same Place, Same Money, Same Date)
                 if check_similar_transaction(loc_check, float(tx.get("valor_total") or 0.0), tx.get("dt_transacao") or today_str):
                     tx["alerta_duplicidade"] = True
 
             # --- CODE-FORCED MATH & DISCOUNT FALLBACK ---
+            # LLMs are notoriously bad at math. This block recalculates the invoice totals manually.
             val_total = float(tx.get("valor_total") or 0.0)
             
             # 1. Calculates the true gross total directly from the items
@@ -404,7 +437,7 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
                 buttons.append(["➕ Adicionar Novo Cartão"])
                 user_data["estado"] = "AGUARDANDO_SELECAO_CARTAO"
                 
-                # Dinamiza a pergunta se for entrada ou saída
+                # Dynamic wording based on Income/Expense
                 verb = "Recebimento" if tx_type == "RECEITA" else "Compra"
                 await bot.send_message(chat_id, f"💳 {verb} em *{loc_name}* (R$ {tx_val:.2f})\nQual cartão?", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True), parse_mode="Markdown")
                 return
@@ -424,7 +457,7 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             await bot.send_message(chat_id, f"📅 Qual a *Data de Vencimento da 1ª Parcela*?\n*(As outras {parcels-1} parcelas cairão no mesmo dia nos meses seguintes)*\n\nExemplo: `15/05/2026`", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
             return
 
-    # Once all cascades pass, generate the final parsed data
+     # --- ALL CASCADES PASSED: Generate Final Parsing ---
     db_card = get_card_from_db(bank, variant) if bank else None
     is_prepaid = db_card and db_card.get("closing") == 0 and db_card.get("due") == 0
     is_cash = method in ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança"]
@@ -496,6 +529,10 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     
     await bot.send_message(chat_id, summary, parse_mode="Markdown", reply_markup=ReplyKeyboardMarkup([["Sim", "Não"]], resize_keyboard=True, one_time_keyboard=True))
 
+# ==============================================================================
+# --- User Interface & Commands ---
+# ==============================================================================
+
 @security_check
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Flushes the database queue for the user and clears their active session states."""
@@ -508,11 +545,14 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str, filter_tx_id: int = None):
     """
-    Renders the interactive AP Dashboard with Progressive Disclosure (Summary vs Detailed).
-    Added contextual pending values (Total Expected vs Total Pending).
+    Renders the interactive Accounts Payable (AP) Dashboard on Telegram.
+    Implements Progressive Disclosure:
+    - Summary Mode: Shows a Monospace Ledger comparing 'Expected' vs 'Pending' totals.
+    - Detailed Mode: Hides the header and expands inline buttons for tactical management.
     """
     bills = get_pending_bills_by_month(target_month)
     
+    # State mapping to handle Progressive Disclosure
     view_mode = context.user_data.get(f"view_mode_{target_month}", "summary")
     if filter_tx_id: view_mode = "detailed"
 
@@ -539,6 +579,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         grouped_cards = {}
         standalone_bills = []
         
+        # Group bills by Credit Card to construct the UI Accordion
         for b in bills:
             if b['bank']:
                 group_key = f"{b['bank']}_{b['variant']}" if b['variant'] else b['bank']
@@ -552,9 +593,8 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 
         expanded_groups = context.user_data.setdefault(f"expanded_{target_month}", {})
         
-        # SÓ RENDERIZA O HEADER MONOSPACE SE ESTIVER NA VISÃO RESUMIDA
-        if view_mode == "summary":
-            # Busca todas as transações do mês (Pagas e Pendentes) para fazer a matemática
+        # --- UI: Render Monospace Header ONLY if in Summary Mode ---
+        if view_mode == "summary":            
             all_tx = get_cash_flow_by_month(target_month)
             
             total_despesas = sum(t['expected_amount'] for t in all_tx if t['type'] == 'DESPESA')
@@ -590,15 +630,14 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         else:
             text += "\n👇 *Selecione uma conta abaixo para gerenciar:*\n"
 
-    # ==========================================
-    # LÓGICA DE BOTÕES
-    # ==========================================
+    # --- UI: Build Inline Keyboard Navigations ---
     target_dt = datetime.strptime(target_month, "%m/%Y")
     prev_month = (target_dt - relativedelta(months=1)).strftime("%m/%Y")
     next_month = (target_dt + relativedelta(months=1)).strftime("%m/%Y")
     tx_param = f"_tx_{filter_tx_id}" if filter_tx_id else ""
     
     if view_mode == "summary" and bills:
+        # STATE 1: Summary Mode (Nav arrows + Expand button)
         nav_row = [
             InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}{tx_param}"),
             InlineKeyboardButton("🔍 Ver Detalhes", callback_data=f"view_detailed_{target_month}{tx_param}"),
@@ -606,6 +645,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         ]
         keyboard.append(nav_row)
     else:
+        # STATE 2: Detailed Mode (Expandable buttons for tactical management)
         if bills and not filter_tx_id:
             keyboard.append([InlineKeyboardButton("⬅️ Voltar ao Resumo", callback_data=f"view_summary_{target_month}{tx_param}")])
             
@@ -622,6 +662,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 parent_text = f"{icon_alert} {display_name} | R$ {fmt_money(card['total_amount'])} {toggle_icon}"
                 keyboard.append([InlineKeyboardButton(parent_text, callback_data=f"toggle_{card['bank']}_{safe_var}_{target_month}")])
                 
+                # Render children items if Accordion is expanded
                 if is_expanded:
                     keyboard.append([InlineKeyboardButton("   💸 Pagar Fatura Fechada", callback_data=f"fatgroup_{card['bank']}_{safe_var}_{target_month}")])
                     for item in card['items']:
@@ -636,6 +677,7 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 btn_text = f"{icon} {b['location'][:14]} | {sign}R$ {fmt_money(b['amount'])}"
                 keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"fatura_{b['id']}_{target_month}")])
 
+        # Bottom Navigation
         nav_row = [
             InlineKeyboardButton(f"⬅️ {prev_month}", callback_data=f"mes_{prev_month}{tx_param}"),
             InlineKeyboardButton(f"{next_month} ➡️", callback_data=f"mes_{next_month}{tx_param}")
@@ -658,13 +700,17 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     markup = InlineKeyboardMarkup(keyboard)
 
+    # Edit the existing message if called via callback, otherwise send a new one.
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
 
 async def ask_for_payment_amount(bot, chat_id, query, target_month, pay_date, bill_id=None, group_bank=None, group_variant=None):
-    """Modified to include dynamic text based on Transaction Type (Income vs Expense)."""
+    """
+    Renders the UI asking for the exact amount paid (to handle partial payments or discounts).
+    Includes dynamic wording depending on if the transaction is an Income or Expense.
+    """
     amount = 0.0
     is_income = False
     
@@ -703,7 +749,8 @@ async def ask_for_payment_amount(bot, chat_id, query, target_month, pay_date, bi
 async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str):
     """
     Renders the Financial Ledger (Extrato) on Telegram.
-    Clean UI: Removed heavy line separators in favor of double spacing.
+    Implements an 'Invisible Grid' UI approach: using spacing instead of heavy symbols to separate data blocks.
+    Separates general cash flow from Benefits flow (VR/VA).
     """
     transactions = get_cash_flow_by_month(target_month)
     
@@ -713,6 +760,7 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     main_tx = []
     ben_tx = []
     
+    # Isolate Benefit Cards so they don't artificially inflate the user's available cash balance
     for t in transactions:
         m = f"{t.get('method', '')} {t.get('bank', '')} {t.get('variant', '')}".lower()
         if "benefício" in m or "beneficio" in m or "pré-pago" in m or "pre-pago" in m or "vr" in m or "va" in m or "caju" in m:
@@ -742,7 +790,6 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     if ben_tx:
         text += f"\n🎫 *Saldo Benefício:* R$ {fmt_money(ben_saldo_atual)}\n"
 
-    # Substituição da linha pesada por \n\n
     text += "\n\n"
     text += f"💵 *Receitas*\n"
     text += f"  Realizado: R$ {fmt_money(rec_pagas)}\n"
@@ -752,7 +799,6 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
     text += f"  Realizado: R$ {fmt_money(desp_pagas)}\n"
     text += f"  Previsto:  R$ {fmt_money(desp_prev)}\n"
     
-    # Substituição da linha pesada por \n\n
     text += "\n\n"
     text += "📋 *Últimos Lançamentos*\n"
     
@@ -821,13 +867,21 @@ async def list_pending_bills(update: Update, context: ContextTypes.DEFAULT_TYPE)
     current_month = datetime.now(timezone(timedelta(hours=-3))).strftime("%m/%Y")
     await show_bills_month(update, context, current_month)
 
+# ==============================================================================
+# --- Telegram Callback Router (Inline Keyboard Handlers) ---
+# ==============================================================================
+
 @security_check
 async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Router for all Telegram Inline Buttons. Adapted for dynamic Income/Expense text."""
+    """
+    Central Router for all Telegram Inline Buttons (Callbacks).
+    Routes everything from UI toggles to payment approvals and navigations.
+    """
     query = update.callback_query
     await query.answer() 
     data = query.data
 
+    # --- Global Exits ---
     if data == "close_panel":
         context.user_data.clear()
         await query.edit_message_text("✅ Painel fechado.", parse_mode="Markdown")
@@ -838,26 +892,22 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("🛑 Ação cancelada. Você pode enviar novos recibos normalmente.", parse_mode="Markdown")
         return
     
+    # --- Accordion Toggles (Progressive Disclosure) ---
     elif data.startswith("toggle_"):
         parts = data.split("_")
         bank = parts[1]
         variant = parts[2]
         target_month = parts[3]
         
-        # Recria a chave do grupo
         group_key = f"{bank}_{variant}" if variant != "none" else bank
-        
-        # Acessa a memória de acordeons deste mês
         expanded_dict = context.user_data.setdefault(f"expanded_{target_month}", {})
         
-        # Inverte o estado atual (Se True vira False, se False vira True)
-        expanded_dict[group_key] = not expanded_dict.get(group_key, False)
-        
-        # Chama a função para desenhar a tela novamente com o novo estado
+        # Inverts boolean state and redraws screen
+        expanded_dict[group_key] = not expanded_dict.get(group_key, False)        
         await show_bills_month(update, context, target_month)
     
+    # --- Summary vs Detailed View Switcher ---
     elif data.startswith("view_"):
-        # Gatilho de mudança entre Summary e Detailed
         parts = data.split("_")
         mode = parts[1] # "summary" ou "detailed"
         target_month = parts[2]
@@ -866,6 +916,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         context.user_data[f"view_mode_{target_month}"] = mode
         await show_bills_month(update, context, target_month, filter_tx_id=filter_tx_id)
     
+    # --- Help Menu Routing ---
     elif data == "help_main":
         await help_command(update, context)
         return
@@ -953,7 +1004,6 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
                 "Se você enviou várias notas e a IA entrou em espera por limite de uso (Rate Limit), digitar `/cancelar` limpa todas as suas notas pendentes que estão na fila do banco de dados."
             )    
             
-        # Botões universais para retornar ou fechar
         keyboard = [
             [InlineKeyboardButton("⬅️ Voltar ao Menu", callback_data="help_main")],
             [InlineKeyboardButton("❌ Fechar Ajuda", callback_data="close_panel")]
@@ -961,6 +1011,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return
 
+    # --- Dashboards Navigation ---
     elif data.startswith("extmes_"):
         parts = data.split("_")
         target_month = parts[1]
@@ -972,6 +1023,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         filter_tx_id = int(parts[3]) if len(parts) > 3 and parts[2] == "tx" else None
         await show_bills_month(update, context, target_month, filter_tx_id=filter_tx_id)
 
+    # --- Individual Bill Management ---
     elif data.startswith("fatura_"):
         parts = data.split("_")
         bill_id = parts[1]
@@ -999,6 +1051,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         keyboard.append([InlineKeyboardButton("⬅️ Voltar", callback_data=f"mes_{target_month}")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    # --- Grouped Card Management ---
     elif data.startswith("fatgroup_"):
         parts = data.split("_")
         bank = parts[1]
@@ -1014,6 +1067,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         ]
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    # --- Execution: Begin Payment Flow ---
     elif data.startswith("pagar_"):
         parts = data.split("_")
         bill_id = int(parts[1])
@@ -1024,6 +1078,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill = next((b for b in bills if str(b['id']) == str(bill_id)), None)
         is_income = bill and bill.get('type', 'DESPESA') == 'RECEITA'
         
+        # Injects the payment state into the session
         context.user_data["estado"] = "WAITING_FOR_BAIXA_METHOD"
         context.user_data["parcela_pagamento_id"] = bill_id
         context.user_data["parcela_target_month"] = target_month
@@ -1066,6 +1121,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         ]
         await query.edit_message_text("📅 *Qual a data do pagamento da fatura?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
+    # --- Execution: Processing Payment Data ---
     elif data.startswith("paydate_hoje_"):
         target_month = context.user_data.get("parcela_target_month")
         pay_date = datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y")
@@ -1084,7 +1140,6 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         bill_id = int(data.split("_")[3])
         pay_date = context.user_data.get("parcela_pagamento_data")
         
-        # Puxa os métodos novos salvos na sessão
         n_method = context.user_data.get("baixa_new_method")
         n_bank = context.user_data.get("baixa_new_bank")
         n_variant = context.user_data.get("baixa_new_variant")
@@ -1112,6 +1167,7 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text(f"❌ {msg}", parse_mode="Markdown")
         context.user_data.clear()
 
+    # --- Execution: Soft Deleting ---
     elif data.startswith("cancelar_"):
         parts = data.split("_")
         bill_id = int(parts[1])
@@ -1120,6 +1176,10 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.edit_message_text("✅ *Registro ignorado/cancelado com sucesso!*\n(Isso não apaga outras parcelas originais).", parse_mode="Markdown")
             await asyncio.sleep(2)
             await show_bills_month(update, context, target_month)
+
+# ==============================================================================
+# --- Telegram Message Handlers ---
+# ==============================================================================
 
 @security_check
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1162,7 +1222,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get("estado")
     try:
-        # FSM: Paying a Bill -> Asking Method
+        # FSM: Paying a Bill -> Validating the Payment Method overridden by the user
         if state == "WAITING_FOR_BAIXA_METHOD":
             ans = update.message.text.strip()
             if ans != "🔄 Manter Método Original":
@@ -1172,13 +1232,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             method_needs_card = any(word in ans.lower() for word in ["cartão", "cartao", "crédito", "credito", "débito", "debito", "benefício", "beneficio"])
             
+            # If the new method is a card, detour the flow to ask WHICH card it was.
             if method_needs_card and ans != "🔄 Manter Método Original":
                 buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in list_cards_from_db()]
                 buttons.append(["❌ Cancelar Ação"])
                 context.user_data["estado"] = "WAITING_FOR_BAIXA_CARD"
                 await update.message.reply_text("💳 Qual cartão?", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True))
                 return
-                
+            
+            # Otherwise, proceed straight to the payment date
             context.user_data["estado"] = "WAITING_FOR_PAYMENT_DATE"
             bill_id = context.user_data["parcela_pagamento_id"]
             action_word = "recebimento" if context.user_data.get("is_income") else "pagamento"
@@ -1188,7 +1250,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📅 *Qual a data do {action_word}?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             return
             
-        # FSM: Paying a Bill -> Asking Card
+        # FSM: Paying a Bill -> Picking a specific Credit Card
         if state == "WAITING_FOR_BAIXA_CARD":
             ans = update.message.text.strip()
             if ans == "❌ Cancelar Ação":
@@ -1209,7 +1271,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📅 *Qual a data do {action_word}?*\n(Clique no botão para Hoje ou digite a data: `DD/MM/YYYY`).", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
             return
 
-        # FSM: Paying a Bill -> Custom Date
+        # FSM: Paying a Bill -> Custom Date override (Regime de Caixa reallocation)
         if state == "WAITING_FOR_PAYMENT_DATE":
             ans = update.message.text.lower().strip()
             target_month = context.user_data.get("parcela_target_month")
@@ -1236,7 +1298,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await ask_for_payment_amount(context.bot, chat_id, None, target_month, pay_date, bill_id=bill_id)
             return
             
-        # FSM: Paying a Bill -> Custom Amount (Anticipation/Discount)
+        # FSM: Paying a Bill -> Custom Amount (Calculates partial payments or discounts)
         if state == "WAITING_FOR_PAYMENT_AMOUNT":
             ans = update.message.text.lower().strip()
             pay_date = context.user_data.get("parcela_pagamento_data")
@@ -1275,7 +1337,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.clear()
             return
 
-        # FSM: Adding Transaction -> User inputs a fixed Payment Method
+        # FSM: Adding Transaction -> User inputs a fixed Payment Method to fix LLM hallucination
         if state == "AGUARDANDO_METODO_PAGAMENTO":
             choice = update.message.text
             t = context.user_data["transacao_pendente_json"]["transacoes"][0]
@@ -1339,7 +1401,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"Fechamento e vencimento? (Ex: 1 e 8)")
             return
 
-        # FSM: Adding Transaction -> Upserting a new card (Dates)
+        # FSM: Adding Transaction -> Upserting a new card (Rules phase)
         if state == "AGUARDANDO_DATAS_CARTAO":
             numbers = re.findall(r'\d+', update.message.text)
             if len(numbers) >= 2:
@@ -1399,13 +1461,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    # Verifica se foi chamado pelo comando /help ou pelo botão "Voltar"
     if update.callback_query:
         await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
     else:
         await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
 
+# ==============================================================================
 # --- Application Entry Point & Webhook Setup ---
+# ==============================================================================
 
 # Builds the Telegram Bot application
 telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1425,12 +1488,14 @@ telegram_app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Executa ao iniciar o servidor (Startup)
+    """
+    ASGI Lifespan manager. 
+    Ensures the Telegram Application turns on and off synchronously with the FastAPI web server.
+    """
     await telegram_app.initialize()
     await telegram_app.start()
     print("✅ Telegram App iniciado e ouvindo via Webhook!")
     yield
-    # Executa ao desligar o servidor (Shutdown)
     await telegram_app.stop()
     await telegram_app.shutdown()
     print("🛑 Telegram App desligado com segurança.")
@@ -1439,7 +1504,10 @@ api = FastAPI(lifespan=lifespan)
 
 @api.post("/webhook")
 async def process_webhook(request: Request):
-    """O endpoint onde o Telegram baterá a porta para entregar mensagens."""
+    """
+    The endpoint where Telegram knocks to deliver new messages (Webhook mode).
+    It parses the JSON and feeds it into the standard Telegram Ext application.
+    """
     req = await request.json()
     update = Update.de_json(req, telegram_app.bot)
     await telegram_app.process_update(update)
@@ -1447,7 +1515,7 @@ async def process_webhook(request: Request):
 
 @api.get("/health")
 async def health_check():
-    """Endpoint vital para o Railway saber que seu app está vivo."""
+    """Vital endpoint for Railway to know the application container didn't crash."""
     return {"status": "Zotto API is running", "env": ENV}
 
 if __name__ == '__main__':
@@ -1455,10 +1523,10 @@ if __name__ == '__main__':
     print(f"🚀 Iniciando Zotto em ambiente ({ENV.upper()})...")
     
     if ENV == "prod":
-        # EM PRODUÇÃO: Roda o servidor web FastAPI para receber Webhooks
+         # IN PRODUCTION: Runs the FastAPI web server to receive Webhooks from Telegram
         port = int(os.getenv("PORT", 8000))
         uvicorn.run(api, host="0.0.0.0", port=port)
     else:
-        # EM DEV: Roda no modo Polling (para você testar no PC sem Ngrok)
+        # IN DEVELOPMENT: Runs local Long Polling (so you don't need Ngrok)
         print("🔄 Modo Webhook ignorado. Iniciando Long Polling local...")
         telegram_app.run_polling()
