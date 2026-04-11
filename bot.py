@@ -994,6 +994,14 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
                 "restante de um financiamento ou compra longa.\n"
                 "Use *\"Voltar à Visão Geral\"* para sair do modo isolado."
             )
+        elif topic == "dash":
+            text = (
+                "🌐 *WEB APP NATIVO (/dash)*\n\n"
+                "O Zotto possui integração total com os **Mini Apps** do Telegram.\n\n"
+                "Ao enviar o comando `/dash`, você receberá um botão especial. "
+                "Clicar nele fará com que o painel de Inteligência Financeira "
+                "deslize para cima na sua tela, como um aplicativo nativo, sem precisar sair do chat!"
+            )    
         elif topic == "cancelar":
             text = (
                 "🛑 *BOTÃO DE EMERGÊNCIA (/cancelar)*\n\n"
@@ -1479,7 +1487,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📥 Como lançar transações", callback_data="help_lancamentos")],
         [InlineKeyboardButton("🗓️ Painel de Contas (/contas)", callback_data="help_painel")],
-        [InlineKeyboardButton("📊 Painel de Extrato (/extrato)", callback_data="help_extrato")],
+        [InlineKeyboardButton("🧾 Painel de Extrato (/extrato)", callback_data="help_extrato")],
+        [InlineKeyboardButton("📊 Dashboard (/dash)", callback_data="help_dash")],
         [InlineKeyboardButton("💸 Como Pagar / Baixar", callback_data="help_pagamentos")],
         [InlineKeyboardButton("🔍 Recursos Avançados", callback_data="help_avancado")],
         [InlineKeyboardButton("🛑 Cancelar Ações (/cancelar)", callback_data="help_cancelar")],
