@@ -4,7 +4,7 @@ env/
 
 # Arquivos de Senha
 .env
-sync_db.ps1
+#sync_db.ps1
 
 # Cache do Python
 __pycache__/
