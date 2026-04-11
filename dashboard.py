@@ -5,6 +5,9 @@ import plotly.graph_objects as go
 from datetime import datetime, timezone, timedelta
 from database import db_pool
 
+# ==============================================================================
+# --- Streamlit Page Configuration ---
+# ==============================================================================
 st.set_page_config(
     page_title="Zotto BI | Inteligência Financeira",
     page_icon="📊",
@@ -12,18 +15,24 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
+# ==============================================================================
+# --- Utility Helpers & Constants ---
+# ==============================================================================
 
+# Keywords used to identify Corporate Benefit Cards (Food/Meal vouchers)
+# This is crucial to separate restricted funds from actual liquid cash.
 BENEFIT_KEYWORDS = ["benefício", "beneficio", "pré-pago", "pre-pago", "vr", "va", "caju", "alelo", "sodexo", "ticket"]
-
 BEN_BANKS = ["caju", "alelo", "sodexo", "ticket", "flash", "ifood benefícios", "pluxee"]
 
 def fmt_brl(value: float) -> str:
+    """Formats a float into Brazilian Real currency string (e.g., 1,234.56 -> R$ 1.234,56)."""
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def normalize_series(s: pd.Series) -> pd.Series:
+    """
+    Sanitizes pandas text columns to prevent UI bugs and grouping errors.
+    Removes accents, weird encodings (Mojibake), and standardizes to Title Case.
+    """
     return (
         s.astype(str)
         .str.normalize("NFKD")
@@ -34,21 +43,23 @@ def normalize_series(s: pd.Series) -> pd.Series:
     )
 
 def is_benefit_row(method: str, bank: str) -> bool:
+    """Evaluates if a transaction belongs to a Benefit Card based on its method or bank name."""
     m = str(method).lower()
     b = str(bank).lower()
     return any(k in m for k in BENEFIT_KEYWORDS) or any(k in b for k in BEN_BANKS)
 
 
-# ─────────────────────────────────────────────
-# QUERIES — duas camadas independentes
-# ─────────────────────────────────────────────
+# ==============================================================================
+# --- Data Loading Queries (The Two-Layer Architecture) ---
+# ==============================================================================
 
 @st.cache_data(ttl=60)
 def load_installments() -> pd.DataFrame:
     """
-    Camada financeira — regime de caixa.
-    `month` = mês em que o dinheiro se moveu (campo mutável, atualizado pelo bot).
-    `paid_amount` = valor efetivamente pago (pode diferir de `amount` por desconto).
+    LAYER 1: FINANCIAL LAYER (Cash Basis / Regime de Caixa)
+    Focuses on *when the money actually moves*. 
+    It pulls data from the 'installments' table (which dictates the exact month the bill hits the account),
+    joined with the parent 'transactions' table to get metadata (location, category).
     """
     sql = """
         SELECT
@@ -83,21 +94,26 @@ def load_installments() -> pd.DataFrame:
     finally:
         db_pool.putconn(conn)
 
+    # Data Sanitization
     df["location_name"] = normalize_series(df["location_name"])
     df["macro_category"] = normalize_series(df["macro_category"])
+    
+    # Date Casting for Time-Series Analysis
     df["month_dt"] = pd.to_datetime(df["month"], format="%m/%Y")
     df["year"] = df["month_dt"].dt.year.astype(str)
     df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
     df["payment_date"] = pd.to_datetime(df["payment_date"], errors="coerce")
     df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
 
-    # Valor "real" do mês: paid_amount para PAID, expected_amount para PENDING
+    # The 'real_amount' logic:
+    # If the bill is paid, we care about the exact 'paid_amount' (which might include discounts).
+    # If it's pending, we rely on the 'expected_amount' mapped by the LLM.
     df["real_amount"] = df.apply(
         lambda r: r["paid_amount"] if r["payment_status"] == "PAID" else r["expected_amount"],
         axis=1,
     )
 
-    # Flag benefício
+    # Flags transactions that shouldn't mix with liquid cash
     df["is_benefit"] = df.apply(
         lambda r: is_benefit_row(r["payment_method"], r["card_bank"]), axis=1
     )
@@ -108,8 +124,9 @@ def load_installments() -> pd.DataFrame:
 @st.cache_data(ttl=60)
 def load_items() -> pd.DataFrame:
     """
-    Camada operacional — regime de competência (data da compra).
-    Inclui hierarquia completa de categorias do item.
+    LAYER 2: OPERATIONAL LAYER (Accrual Basis / Regime de Competência)
+    Focuses on *what was bought and when it was bought*, regardless of how many months it will take to pay.
+    Pulls line-by-line item details from receipts to feed the micro-management tabs (Treemaps, Top Items).
     """
     sql = """
         SELECT
@@ -140,25 +157,29 @@ def load_items() -> pd.DataFrame:
     finally:
         db_pool.putconn(conn)
 
+    # Data Sanitization
     df["location_name"]  = normalize_series(df["location_name"])
     df["item_name"]      = normalize_series(df["item_name"])
     df["brand"]          = normalize_series(df["brand"])
     df["cat_macro"]      = normalize_series(df["cat_macro"])
     df["cat_category"]   = normalize_series(df["cat_category"])
     df["cat_subcategory"]= normalize_series(df["cat_subcategory"])
+    
+    # Date Casting
     df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
     df["month_dt"]       = pd.to_datetime(df["month_compra"], format="%m/%Y", errors="coerce")
 
     return df
 
 
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
+# ==============================================================================
+# --- Main Dashboard Application ---
+# ==============================================================================
 
 def main():
     st.title("📊 Zotto BI — Inteligência Financeira")
 
+    # Load data from PostgreSQL
     df_inst = load_installments()
     df_items = load_items()
 
@@ -166,40 +187,72 @@ def main():
         st.warning("Ainda não há dados no banco para gerar o painel.")
         return
 
+    # Determine current real-world time to set default selections intelligently
     br_tz = timezone(timedelta(hours=-3))
     hoje = datetime.now(br_tz)
     ano_atual = str(hoje.year)
     mes_atual = hoje.strftime("%m/%Y")
 
-    # ── SIDEBAR ──────────────────────────────
+    # ==========================================
+    # --- Sidebar (Global Filters) ---
+    # ==========================================
     with st.sidebar:
         st.header("⚙️ Filtros Globais")
 
-        anos = sorted(df_inst["year"].unique().tolist(), reverse=True)
-        idx_ano = anos.index(ano_atual) if ano_atual in anos else 0
+        # 1. Date Filters (Chronological order)
+        anos = sorted(df_inst["year"].unique().tolist())
+        idx_ano = anos.index(ano_atual) if ano_atual in anos else (len(anos) - 1)
         ano_sel = st.selectbox("Ano", anos, index=idx_ano)
 
+        # Update available months based on the selected year
         df_ano = df_inst[df_inst["year"] == ano_sel]
         meses = sorted(df_ano["month"].unique().tolist(), key=lambda x: datetime.strptime(x, "%m/%Y"))
         idx_mes = meses.index(mes_atual) if mes_atual in meses else len(meses) - 1
         mes_sel = st.selectbox("Mês (para análises mensais)", meses, index=idx_mes)
 
         st.markdown("---")
+        
+        # 2. Location Filter (Blacklist UX Approach)
+        # Instead of pre-selecting everything (which causes a massive wall of tags in Streamlit),
+        # we start empty. The user only selects locations they want to EXCLUDE from the analysis.
+        locais_disp = sorted(df_inst["location_name"].dropna().unique().tolist())
+        locais_excluidos = st.multiselect(
+            "🏢 Ocultar locais específicos:", 
+            options=locais_disp, 
+            default=[], 
+            help="Por padrão, o painel analisa TODOS os locais. Adicione aqui as empresas que você deseja ESCONDER dos gráficos."
+        )
+
+        st.markdown("---")
+        
+        # 3. Liquidity Filter
         excluir_beneficio = st.checkbox("Excluir Carteira Benefício (VA/VR)", value=False,
             help="Marque para analisar apenas o dinheiro líquido, sem VA/VR.")
 
         st.markdown("---")
         st.caption("💡 Abas de tendência e projeção ignoram o filtro de mês e usam o ano selecionado.")
 
-    # Aplica exclusão de benefício globalmente quando solicitado
+    # ==========================================
+    # --- Apply Global Filters ---
+    # ==========================================
+
+    # Apply Location Blacklist
+    if locais_excluidos:
+        df_inst = df_inst[~df_inst["location_name"].isin(locais_excluidos)]
+        df_items = df_items[~df_items["location_name"].isin(locais_excluidos)]
+
+    # Apply Benefits Exclusion
     if excluir_beneficio:
         df_inst  = df_inst[~df_inst["is_benefit"]]
         df_items = df_items[~df_items["card_bank"].str.lower().apply(
             lambda b: any(k in b for k in BEN_BANKS))]
 
+    # Create a specific dataframe for single-month views
     df_mes = df_inst[df_inst["month"] == mes_sel].copy()
 
-    # ── TABS ─────────────────────────────────
+    # ==========================================
+    # --- Tabs Configuration ---
+    # ==========================================
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🎯  Saúde do Mês",
         "📈  Tendências",
@@ -208,16 +261,16 @@ def main():
         "🛒  Operacional — Itens",
     ])
 
-    # ══════════════════════════════════════════════════════
-    # ABA 1 — SAÚDE DO MÊS
-    # ══════════════════════════════════════════════════════
+    # ==========================================
+    # TAB 1: EXECUTIVE SUMMARY (Current Month)
+    # ==========================================
     with tab1:
         st.subheader(f"Resumo Executivo — {mes_sel}")
 
         df_rec  = df_mes[df_mes["transaction_type"] == "RECEITA"]
         df_desp = df_mes[df_mes["transaction_type"] == "DESPESA"]
 
-        # Cálculos corretos — PAID usa paid_amount, PENDING usa expected_amount
+        # Accurate aggregation separating Realized (Cash in hand) vs Pending (Future commitments)
         rec_realizada  = df_rec[df_rec["payment_status"] == "PAID"]["paid_amount"].sum()
         rec_pendente   = df_rec[df_rec["payment_status"] == "PENDING"]["expected_amount"].sum()
         desp_realizada = df_desp[df_desp["payment_status"] == "PAID"]["paid_amount"].sum()
@@ -230,7 +283,7 @@ def main():
         taxa_poup   = ((rec_total - desp_total) / rec_total * 100) if rec_total > 0 else 0
         desc_total  = df_desp["discount_applied"].sum()
 
-        # KPIs — linha 1
+        # Row 1: High-level KPIs
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Receita Total (Prevista)", fmt_brl(rec_total),
                   delta=fmt_brl(rec_realizada) + " realizado")
@@ -241,7 +294,7 @@ def main():
         c4.metric("Taxa de Poupança", f"{taxa_poup:.1f}%",
                   help="(Receita − Despesa) / Receita × 100. Meta saudável: ≥ 20%.")
 
-        # KPIs — linha 2
+        # Row 2: Secondary KPIs
         c5, c6, c7, c8 = st.columns(4)
         c5.metric("Realizado Receitas", fmt_brl(rec_realizada))
         c6.metric("Realizado Despesas", fmt_brl(desp_realizada), delta_color="inverse")
@@ -249,7 +302,7 @@ def main():
         c8.metric("Economia c/ Descontos", fmt_brl(desc_total),
                   help="Soma de discount_applied — inclui antecipações e descontos negociados.")
 
-        # Carteira benefício (separada)
+        # Optional Benefit Card KPIs (only shows if there's benefit activity)
         df_ben = df_mes[df_mes["is_benefit"]]
         if not df_ben.empty:
             st.markdown("---")
@@ -262,7 +315,7 @@ def main():
 
         st.markdown("---")
 
-        # Gráficos linha 1
+        # Row 3: Main Charts (Category Composition & Pacing)
         col_a, col_b = st.columns(2)
 
         with col_a:
@@ -292,7 +345,7 @@ def main():
                 fig2.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=300)
                 st.plotly_chart(fig2, use_container_width=True)
 
-        # Gráficos linha 2
+        # Row 4: Operational Charts (Locations & Methods)
         col_c, col_d = st.columns(2)
 
         with col_c:
@@ -320,23 +373,29 @@ def main():
                 fig4.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=280)
                 st.plotly_chart(fig4, use_container_width=True)
 
-    # ══════════════════════════════════════════════════════
-    # ABA 2 — TENDÊNCIAS (série histórica do ano)
-    # ══════════════════════════════════════════════════════
+    # ==========================================
+    # TAB 2: HISTORICAL TRENDS (Yearly Series)
+    # ==========================================
     with tab2:
         st.subheader(f"Tendências — {ano_sel}")
 
+        # Slice data for the entire selected year
         df_y = df_inst[df_inst["year"] == ano_sel].copy()
         df_y_desp = df_y[df_y["transaction_type"] == "DESPESA"]
         df_y_rec  = df_y[df_y["transaction_type"] == "RECEITA"]
 
-        # ── Evolução Receita vs Despesa ──
+        # --- Income vs Expense Time Series ---
         st.markdown("### Receita vs Despesa mês a mês")
         trend = (df_y.groupby(["month", "month_dt", "transaction_type"])["real_amount"]
                  .sum().unstack(fill_value=0).reset_index().sort_values("month_dt"))
+        
+        # Ensure columns exist even if data is missing
         if "RECEITA" not in trend.columns: trend["RECEITA"] = 0
         if "DESPESA" not in trend.columns: trend["DESPESA"] = 0
+        
         trend["Saldo"] = trend["RECEITA"] - trend["DESPESA"]
+        
+        # Savings Rate Calculation (Protects against division by zero using Python's native float('nan'))
         trend["Taxa Poupança (%)"] = (trend["Saldo"] / trend["RECEITA"].replace(0, float('nan')) * 100).round(1)
 
         fig_trend = go.Figure()
@@ -351,7 +410,7 @@ def main():
                                 margin=dict(t=10, b=0), height=320)
         st.plotly_chart(fig_trend, use_container_width=True)
 
-        # Taxa de poupança histórica
+        # Savings Rate Evolution
         st.markdown("### Taxa de Poupança — evolução mensal")
         fig_poup = px.line(trend, x="month", y="Taxa Poupança (%)", markers=True,
                            color_discrete_sequence=["#534AB7"])
@@ -362,7 +421,7 @@ def main():
 
         st.markdown("---")
 
-        # ── Evolução por categoria ──
+        # --- Dynamic Category Evolution ---
         st.markdown("### Gastos por Categoria — evolução mensal")
         if not df_y_desp.empty:
             cats_disp = sorted(df_y_desp["macro_category"].unique().tolist())
@@ -380,7 +439,7 @@ def main():
 
         st.markdown("---")
 
-        # ── Participação de cartões ──
+        # --- Credit Card Reliance ---
         st.markdown("### Participação por Cartão no Total Gasto")
         if not df_y_desp.empty:
             df_cards = df_y_desp.copy()
@@ -403,12 +462,13 @@ def main():
 
         st.markdown("---")
 
-        # ── Economia acumulada por descontos ──
+        # --- Cumulative Savings (Gamification metric) ---
         st.markdown("### Economia Acumulada — Descontos & Antecipações")
         df_disc = (df_inst[df_inst["year"] == ano_sel]
                    .groupby(["month", "month_dt"])["discount_applied"]
                    .sum().reset_index().sort_values("month_dt"))
         df_disc["Acumulado"] = df_disc["discount_applied"].cumsum()
+        
         if df_disc["discount_applied"].sum() > 0:
             fig_disc = go.Figure()
             fig_disc.add_trace(go.Bar(x=df_disc["month"], y=df_disc["discount_applied"],
@@ -422,20 +482,22 @@ def main():
         else:
             st.info("Nenhum desconto registrado no ano selecionado.")
 
-    # ══════════════════════════════════════════════════════
-    # ABA 3 — CARTÕES & PARCELAS
-    # ══════════════════════════════════════════════════════
+    # ==========================================
+    # TAB 3: DEBT & CREDIT MANAGEMENT
+    # ==========================================
     with tab3:
         st.subheader("Gestão de Cartões e Parcelamentos")
 
+        # Focuses entirely on unpaid, pending commitments
         df_pend = df_inst[df_inst["payment_status"] == "PENDING"].copy()
 
-        # ── Índice de comprometimento ──
+        # --- Income Commitment Gauge ---
         st.markdown("### Índice de Comprometimento de Renda")
         meses_horizonte = st.slider("Horizonte (meses futuros)", 1, 12, 3)
         hoje_dt = pd.Timestamp(hoje.date())
         limite_dt = hoje_dt + pd.DateOffset(months=meses_horizonte)
 
+        # Sum of all debt within the user-defined horizon
         df_comp = df_pend[
             (df_pend["transaction_type"] == "DESPESA") &
             (df_pend["due_date"].notna()) &
@@ -443,6 +505,7 @@ def main():
         ]
         comprometido = df_comp["expected_amount"].sum()
 
+        # Assumes the selected month's income is the baseline for the future
         rec_mes_ref = (df_inst[(df_inst["month"] == mes_sel) &
                                (df_inst["transaction_type"] == "RECEITA")]["real_amount"].sum())
 
@@ -451,6 +514,8 @@ def main():
             cor = "🟢" if idx_comp < 40 else ("🟡" if idx_comp < 70 else "🔴")
             st.markdown(f"**{cor} {idx_comp:.1f}%** da renda dos próximos {meses_horizonte} meses já está comprometida")
             st.caption(f"Total comprometido: {fmt_brl(comprometido)} | Renda de referência ({meses_horizonte}x {mes_sel}): {fmt_brl(rec_mes_ref * meses_horizonte)}")
+            
+            # Visual Gauge logic
             fig_gauge = go.Figure(go.Indicator(
                 mode="gauge+number", value=round(idx_comp, 1),
                 number={"suffix": "%"},
@@ -470,7 +535,7 @@ def main():
 
         st.markdown("---")
 
-        # ── Curva de dívida ──
+        # --- Debt Curve ---
         st.markdown("### Curva de Dívida — Total Pendente por Mês")
         df_curva = (df_pend[df_pend["transaction_type"] == "DESPESA"]
                     .groupby(["month", "month_dt"])["expected_amount"]
@@ -489,7 +554,7 @@ def main():
 
         st.markdown("---")
 
-        # ── Detalhamento de parcelamentos ──
+        # --- Long-term Financing & Installments List ---
         st.markdown("### Parcelamentos Ativos")
         df_parc = df_pend[
             (df_pend["transaction_type"] == "DESPESA") &
@@ -507,6 +572,7 @@ def main():
                         ).reset_index()
                         .sort_values("total_restante", ascending=False))
 
+            # Streamlit Accordions for tactical drill-downs
             for _, row in agrupado.iterrows():
                 with st.expander(
                     f"🏢 {row['location_name']} — {fmt_brl(row['total_restante'])} "
@@ -526,22 +592,23 @@ def main():
         else:
             st.success("🎉 Nenhum parcelamento ativo no momento.")
 
-    # ══════════════════════════════════════════════════════
-    # ABA 4 — PROJEÇÃO DE CAIXA (longo prazo)
-    # ══════════════════════════════════════════════════════
+    # ==========================================
+    # TAB 4: LONG-TERM PROJECTION (Burn Rate)
+    # ==========================================
     with tab4:
         st.subheader("Projeção de Caixa — Burn Rate")
 
+        # Filters from the selected month ONWARD to plot the future
         df_fut = df_inst[df_inst["month_dt"] >= pd.to_datetime(mes_sel, format="%m/%Y")].copy()
 
         if df_fut.empty:
             st.info("Nenhuma projeção disponível.")
         else:
-            # Agrupa por mês e tipo
             trend_fut = (df_fut.groupby(["month", "month_dt", "transaction_type"])["expected_amount"]
                          .sum().unstack(fill_value=0).reset_index().sort_values("month_dt"))
             if "RECEITA" not in trend_fut.columns: trend_fut["RECEITA"] = 0
             if "DESPESA" not in trend_fut.columns: trend_fut["DESPESA"] = 0
+            
             trend_fut["Saldo"] = trend_fut["RECEITA"] - trend_fut["DESPESA"]
             trend_fut["Saldo Acumulado"] = trend_fut["Saldo"].cumsum()
 
@@ -560,7 +627,6 @@ def main():
                                   height=360, margin=dict(t=10, b=0))
             st.plotly_chart(fig_fut, use_container_width=True)
 
-            # Tabela resumo
             st.markdown("### Detalhamento mensal")
             df_resumo = trend_fut[["month", "RECEITA", "DESPESA", "Saldo", "Saldo Acumulado"]].copy()
             df_resumo.columns = ["Mês", "Receitas (R$)", "Despesas (R$)", "Saldo (R$)", "Saldo Acumulado (R$)"]
@@ -568,9 +634,9 @@ def main():
                 df_resumo[col] = df_resumo[col].apply(lambda v: f"{v:,.2f}")
             st.dataframe(df_resumo, use_container_width=True, hide_index=True)
 
-    # ══════════════════════════════════════════════════════
-    # ABA 5 — OPERACIONAL: ITENS
-    # ══════════════════════════════════════════════════════
+    # ==========================================
+    # TAB 5: ITEM-LEVEL AUDITING (Accrual Data)
+    # ==========================================
     with tab5:
         st.subheader("Visão Operacional — Produtos e Serviços")
         st.caption(
@@ -578,7 +644,7 @@ def main():
             "Use o filtro de mês do sidebar para focar no período desejado."
         )
 
-        # Filtra pelo mês de compra (competência) — não pelo mês de pagamento
+        # Filters by the purchase date (Accrual Basis) - Not the payment date
         df_op = df_items[df_items["month_compra"] == mes_sel].copy()
 
         if df_op.empty:
@@ -589,7 +655,7 @@ def main():
             qtd_notas   = df_op["transaction_id"].nunique()
             ticket_medio = total_itens / qtd_notas if qtd_notas > 0 else 0
 
-            # KPIs operacionais
+            # Operational KPIs
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Total em Itens (NF-e)", fmt_brl(total_itens))
             k2.metric("Notas Fiscais c/ Itens", qtd_notas)
@@ -598,7 +664,7 @@ def main():
 
             st.markdown("---")
 
-            # ── BLOCO 1: Treemap hierárquico ──
+            # --- Block 1: Hierarchical Treemap ---
             st.markdown("### Treemap — Hierarquia de Categorias")
             st.caption("Macro → Categoria → Subcategoria. O tamanho representa o valor gasto.")
             df_tree = df_op[df_op["item_total"] > 0].copy()
@@ -616,7 +682,7 @@ def main():
 
             st.markdown("---")
 
-            # ── BLOCO 2: Drill-down por categoria ──
+            # --- Block 2: Sunburst Drill-down ---
             st.markdown("### Drill-down por Categoria")
             col_l, col_r = st.columns([1, 2])
 
@@ -632,7 +698,6 @@ def main():
 
             df_drill = df_macro if cat_sel == "Todas" else df_macro[df_macro["cat_category"] == cat_sel]
 
-            # Sunburst da seleção
             if not df_drill.empty:
                 fig_sun = px.sunburst(
                     df_drill,
@@ -646,7 +711,7 @@ def main():
 
             st.markdown("---")
 
-            # ── BLOCO 3: Top itens e marcas ──
+            # --- Block 3: Top Items and Brands ---
             st.markdown("### Top Itens & Marcas")
             col_t1, col_t2 = st.columns(2)
 
@@ -679,15 +744,17 @@ def main():
 
             st.markdown("---")
 
-            # ── BLOCO 4: Frequência vs Ticket médio (scatter) ──
+            # --- Block 4: Behavioral Analysis (Scatter) ---
             st.markdown("### Frequência vs Ticket Médio por Estabelecimento")
             st.caption("Estabelecimentos com muitas visitas e ticket alto são candidatos a revisão de hábito.")
+            
             df_scatter = (df_op.groupby("location_name")
                           .agg(
                               visitas=("transaction_id", "nunique"),
                               total_gasto=("item_total", "sum"),
                           ).reset_index())
             df_scatter["ticket_medio"] = df_scatter["total_gasto"] / df_scatter["visitas"]
+            
             if not df_scatter.empty:
                 fig_sc = px.scatter(
                     df_scatter, x="visitas", y="ticket_medio",
@@ -706,9 +773,10 @@ def main():
 
             st.markdown("---")
 
-            # ── BLOCO 5: Heatmap dia × categoria ──
+            # --- Block 5: Temporal Heatmap ---
             st.markdown("### Padrão de Gastos por Dia do Mês")
             st.caption("Concentração de gastos ao longo do mês por categoria.")
+            
             df_op["dia"] = df_op["transaction_date"].dt.day
             df_heat = (df_op.groupby(["dia", "cat_macro"])["item_total"]
                        .sum().reset_index())
@@ -725,7 +793,7 @@ def main():
 
             st.markdown("---")
 
-            # ── BLOCO 6: Tabela auditoria completa ──
+            # --- Block 6: Full Data Table ---
             st.markdown("### Auditoria Completa de Itens")
             col_f1, col_f2, col_f3 = st.columns(3)
             with col_f1:
