@@ -171,6 +171,8 @@ Every message follows a deterministic path from Telegram to the database. Here's
    ```
    *This script creates a disposable container that downloads production data and injects it directly into your local database in memory, without creating files and preserving UTF-8 formatting.*
 
+7. **Test Telegram Mini App Locally (Optional):** To test the `/dash` command locally, you must expose your Streamlit port securely. Download **ngrok**, run `.\ngrok http 0000`, copy the generated `https://...ngrok-free.app` URL, and set it as `DASHBOARD_URL` in your `.env`.
+
 ---
 
 ### ☁️ Cloud Deployment (Railway)
@@ -425,6 +427,8 @@ Toda mensagem segue um caminho determinístico do Telegram até o banco de dados
    .\sync_db.ps1
    ```
    *O script gera um container descartável que baixa os dados de produção e os injeta diretamente no seu banco local em memória, sem gerar arquivos e preservando o formato UTF-8.*
+
+7. **Testar Web App Localmente (Opcional):** Para testar o comando `/dash`, os Mini Apps do Telegram exigem uma URL HTTPS segura. Baixe o **ngrok**, exponha a porta do Streamlit rodando `.\ngrok http 0000`, copie a URL gerada e adicione como `DASHBOARD_URL` no seu `.env`.
 
 ---
 
