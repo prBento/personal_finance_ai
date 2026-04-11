@@ -4,7 +4,6 @@ env/
 
 # Arquivos de Senha
 .env
-sync_db.ps1
 
 # Cache do Python
 __pycache__/
@@ -16,3 +15,7 @@ ROADMAP_V1_V2.md
 # Backups de Banco de Dados
 *.sql
 bkp_zotto.sql
+
+# Ferramentas e túneis locais
+ngrok.exe
+ngrok.yml
