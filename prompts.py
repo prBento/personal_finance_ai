@@ -25,7 +25,8 @@ ESTRUTURA DE SAÍDA OBRIGATÓRIA (Apenas JSON):
   "itens": [
     {
       "codigo": "Código ou null",
-      "nome": "Nome do item ou motivo do recebimento",
+      "nome": "Obrigatório. Nome completo do item ou motivo do recebimento",
+      "marca": "Obrigatório. Extraia APENAS a marca do produto (Ex: Coca-Cola, Pirelli, Omo). Se for impossível deduzir a marca, retorne null.",
       "quantidade": 1.0,
       "valor_unitario": 0.00
     }
@@ -70,17 +71,28 @@ ESTRUTURA DO JSON FINAL:
   "mensagem_interacao": "Ok",
   "transacoes": [
     {
-      "tipo_transacao": "String", "numero_nota": "Número ou null", "serie_nota": "Série ou null",
+      "tipo_transacao": "String", 
+      "numero_nota": "Número ou null", 
+      "serie_nota": "Série ou null",
       "dt_transacao": "DD/MM/YYYY",
       "local_compra": { "nome": "Nome", "tipo": "Físico | Online | App | Boleto/Fatura" },
-      "status": "Ativa", "cartao": { "banco": "Nome ou null", "variante": "Nome ou null" },
-      "valor_original": 0.00, "desconto_aplicado": 0.00, "valor_total": 0.00,
-      "categoria_macro": "Categoria do mapa", "metodo_pagamento": "String",
-      "parcelado": false, "quantidade_parcelas": 1,
+      "status": "Ativa", 
+      "cartao": { "banco": "Nome ou null", "variante": "Nome ou null" },
+      "valor_original": 0.00, 
+      "desconto_aplicado": 0.00, 
+      "valor_total": 0.00,
+      "categoria_macro": "Categoria do mapa", 
+      "metodo_pagamento": "String",
+      "parcelado": false, 
+      "quantidade_parcelas": 1,
       "itens": [
         {
-          "numero_item_nota": null, "item": "Nome", "codigo_produto": "Código ou null",
-          "marca": "Marca ou null", "valor_unitario": 0.00, "quantidade": 1.0,
+          "numero_item_nota": null, 
+          "item": "Nome", 
+          "codigo_produto": "Código ou null",
+          "marca": "Apenas a marca do produto ou null", 
+          "valor_unitario": 0.00, 
+          "quantidade": 1.0,
           "hierarquia_categorias": { "macro": "Mapa", "categoria": "Mapa", "subcategoria": "Mapa", "produto": "Nome" }
         }
       ]
