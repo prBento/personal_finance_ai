@@ -418,7 +418,11 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
                 ], resize_keyboard=True, one_time_keyboard=True)
                 await bot.send_message(chat_id, f"📄 Recebimento de *{loc_name}* (R$ {tx_val:.2f})\nOnde esse valor entrará?", reply_markup=keyboard, parse_mode="Markdown")
             else:
-                keyboard = ReplyKeyboardMarkup([["Cartão de Crédito", "Cartão de Débito"], ["Pix", "Dinheiro", "Boleto"], ["Financiamento", "⏳ Ainda não paguei (Aberto)"]], resize_keyboard=True, one_time_keyboard=True)
+                keyboard = ReplyKeyboardMarkup([
+                    ["Cartão de Crédito", "Cartão de Débito"], 
+                    ["Pix", "Dinheiro", "Boleto"], 
+                    ["Financiamento", "⏳ Ainda não paguei (Aberto)"]
+                ], resize_keyboard=True, one_time_keyboard=True)
                 await bot.send_message(chat_id, f"📄 Compra em *{loc_name}* (R$ {tx_val:.2f})\nComo você pagou?", reply_markup=keyboard, parse_mode="Markdown")
             return
 
@@ -430,24 +434,92 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
 
         # Step 3: Validate Card Info (if applicable)
         method_needs_card = any(word in method for word in ["cartão", "cartao", "crédito", "credito", "débito", "debito", "benefício", "beneficio"])
-        
+
         if method_needs_card:
-            if not bank:
+            db_card = get_card_from_db(bank, variant) if bank else None
+
+            # Smart Fuzzy Search: fallback when exact match fails
+            if bank and not db_card:
+                all_cards = list_cards_from_db()
+
+                # Strip LLM noise (e.g., "cartão de crédito American" → "American")
+                b_clean = re.sub(r'\b(cartão|cartao|crédito|credito|débito|debito|de)\b', '', bank.lower(), flags=re.IGNORECASE)
+                v_clean = re.sub(r'\b(cartão|cartao|crédito|credito|débito|debito|de)\b', '', variant.lower(), flags=re.IGNORECASE) if variant else ""
+
+                b_search = " ".join(b_clean.split())
+                v_search = " ".join(v_clean.split())
+
+                matching_cards = [
+                    c for c in all_cards
+                    if b_search in c['bank'].lower().strip() or c['bank'].lower().strip() in b_search
+                ]
+
+                if len(matching_cards) == 1:
+                    # Single match: auto-correct silently if variant also matches (or wasn't provided)
+                    matched_card = matching_cards[0]
+                    m_var = matched_card['variant'].lower().strip() if matched_card['variant'] else ""
+
+                    if not v_search or (m_var and (v_search in m_var or m_var in v_search)):
+                        tx["cartao"]["banco"] = matched_card['bank']
+                        tx["cartao"]["variante"] = matched_card['variant']
+                        bank, variant, db_card = matched_card['bank'], matched_card['variant'], matched_card
+
+                elif len(matching_cards) > 1:
+                    # Multiple matches: try exact match first to resolve ambiguity silently
+                    exact_match = None
+                    for c in matching_cards:
+                        c_bank = c['bank'].lower().strip()
+                        c_var = c['variant'].lower().strip() if c['variant'] else ""
+                        if b_search == c_bank and v_search == c_var:
+                            exact_match = c
+                            break
+
+                    if exact_match:
+                        tx["cartao"]["banco"] = exact_match['bank']
+                        tx["cartao"]["variante"] = exact_match['variant']
+                        bank, variant, db_card = exact_match['bank'], exact_match['variant'], exact_match
+                    else:
+                        # Ambiguity unresolved: ask the user to pick
+                        buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in matching_cards]
+                        buttons.append(["➕ Adicionar Novo Cartão"])
+                        user_data["estado"] = "AGUARDANDO_SELECAO_CARTAO"
+
+                        clean_bank = " ".join(dict.fromkeys(bank.split()))
+                        await bot.send_message(
+                            chat_id,
+                            f"💳 Você tem mais de um cartão *{clean_bank}*.\nQual deles você usou?",
+                            reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True),
+                            parse_mode="Markdown"
+                        )
+                        return
+
+            # 3.3: Unresolved state (Completely new card OR LLM failed to identify any bank)
+            if not db_card:
                 buttons = [[f"{c['bank']} {c['variant']}".strip()] for c in list_cards_from_db()]
                 buttons.append(["➕ Adicionar Novo Cartão"])
                 user_data["estado"] = "AGUARDANDO_SELECAO_CARTAO"
                 
-                # Dynamic wording based on Income/Expense
-                verb = "Recebimento" if tx_type == "RECEITA" else "Compra"
-                await bot.send_message(chat_id, f"💳 {verb} em *{loc_name}* (R$ {tx_val:.2f})\nQual cartão?", reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True), parse_mode="Markdown")
+                if bank:
+                    # UNIVERSAL LLM HALLUCINATION CLEANUP for UI
+                    # Converts "American Express American" into "American Express" by stripping duplicates
+                    clean_bank = " ".join(dict.fromkeys(bank.split()))
+                    nome_sugerido = f"{clean_bank} {variant}".strip() if variant else clean_bank
+                    
+                    await bot.send_message(
+                        chat_id, 
+                        f"💳 *{nome_sugerido}* não cadastrado.\nSelecione um existente abaixo ou adicione um cartão novo:", 
+                        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True), 
+                        parse_mode="Markdown"
+                    )
+                else:
+                    verb = "Recebimento" if tx_type == "RECEITA" else "Compra"
+                    await bot.send_message(
+                        chat_id, 
+                        f"💳 {verb} em *{loc_name}* (R$ {tx_val:.2f})\nQual cartão?", 
+                        reply_markup=ReplyKeyboardMarkup(buttons, resize_keyboard=True, one_time_keyboard=True), 
+                        parse_mode="Markdown"
+                    )
                 return
-            else:
-                db_card = get_card_from_db(bank, variant)
-                # If the card is unknown, pause and learn its rules (upsert logic)
-                if not db_card:
-                    user_data.update({"estado": "AGUARDANDO_DATAS_CARTAO", "pendente_banco": bank, "pendente_variante": variant})
-                    await bot.send_message(chat_id, f"💳 Cartão Novo: *{bank} {variant}*!\nQual *fechamento e vencimento*? (Ex: 1 e 8)", parse_mode="Markdown")
-                    return
 
         # Step 4: Validate Target Date for long-term debts
         parcels = int(tx.get("quantidade_parcelas") or 1)
@@ -1358,6 +1430,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
             context.user_data["estado"] = None
             context.user_data["is_pdf"] = False
+            context.user_data["metodo_confirmado"] = True
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
 
@@ -1406,7 +1479,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             context.user_data.update({"pendente_banco": banco_norm, "pendente_variante": var_norm, "estado": "AGUARDANDO_DATAS_CARTAO"})
             context.user_data["transacao_pendente_json"]["transacoes"][0]["cartao"] = {"banco": banco_norm, "variante": var_norm}
-            await update.message.reply_text(f"Fechamento e vencimento? (Ex: 1 e 8)")
+            await update.message.reply_text(f"Qual o dia de Fechamento e Vencimento do cartão? (Ex: 1 e 8)")
             return
 
         # FSM: Adding Transaction -> Upserting a new card (Rules phase)
