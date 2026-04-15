@@ -168,8 +168,12 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     # Identify if payment clears immediately (Cash Basis)
     cash_keywords = ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança", "benefício", "pré-pago"]
     is_cash_payment = any(word in method_str for word in cash_keywords)
+    is_credit_card = "crédito" in method_str or "credito" in method_str
     
-    payment_status = "PAID" if (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str else "PENDING"
+    if str(transaction_type).upper() == "RECEITA" and is_credit_card:
+        payment_status = "PENDING"
+    else:
+        payment_status = "PAID" if (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str else "PENDING"
     
     # --- CASH BASIS REALLOCATION LOGIC ---
     if payment_status == "PAID":
@@ -413,10 +417,10 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             if tx_type == "RECEITA":
                 keyboard = ReplyKeyboardMarkup([
                     ["Pix", "Conta Corrente/Poupança"], 
-                    ["Cartão de Benefício", "Dinheiro"],
-                    ["⏳ Ainda não recebi (Previsto)"]
+                    ["Cartão de Crédito (Estorno)", "Dinheiro"],
+                    ["Cartão de Benefício", "⏳ Ainda não recebi (Previsto)"]
                 ], resize_keyboard=True, one_time_keyboard=True)
-                await bot.send_message(chat_id, f"📄 Recebimento de *{loc_name}* (R$ {tx_val:.2f})\nOnde esse valor entrará?", reply_markup=keyboard, parse_mode="Markdown")
+                await bot.send_message(chat_id, f"📄 Recebimento de *{loc_name}* (R$ {tx_val:.2f})\nOnde este valor entrará?", reply_markup=keyboard, parse_mode="Markdown")
             else:
                 keyboard = ReplyKeyboardMarkup([
                     ["Cartão de Crédito", "Cartão de Débito"], 
@@ -588,12 +592,12 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             summary += f"   *(...e mais {len(items_list) - 5} itens)*\n"
         summary += "\n"
         
-    if tx_type == "DESPESA":
-        summary += "*Vencimentos:*\n"
-        for p in tx.get("detalhamento_parcelas", [])[:3]:
-            icon = "✅" if p['status_pagamento'] == 'PAID' else "🔹"
-            summary += f"{icon} {p['data_vencimento']} - R$ {float(p.get('valor') or 0):.2f}\n"
-        if parcels > 3: summary += f"...e mais {parcels - 3} parcelas.\n"
+    summary_title = "*Previsão de Entrada:*\n" if tx_type == "RECEITA" else "*Vencimentos:*\n"
+    summary += summary_title
+    for p in tx.get("detalhamento_parcelas", [])[:3]:
+        icon = "✅" if p['status_pagamento'] == 'PAID' else "🔹"
+        summary += f"{icon} {p['data_vencimento']} - R$ {float(p.get('valor') or 0):.2f}\n"
+    if parcels > 3: summary += f"...e mais {parcels - 3} parcelas.\n"
         
     summary += f"\n📋 *ID:* `{tx.get('numero_nota')}`\n"
     if tx.get("alerta_duplicidade"): summary += f"\n🚨 *ALERTA DE DUPLICIDADE:* Registro idêntico encontrado hoje!\n\n⚠️ *Deseja salvar NOVAMENTE?*"
@@ -657,7 +661,14 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 group_key = f"{b['bank']}_{b['variant']}" if b['variant'] else b['bank']
                 if group_key not in grouped_cards:
                     grouped_cards[group_key] = {"bank": b['bank'], "variant": b['variant'], "total_amount": 0.0, "items": [], "is_overdue": False}
-                grouped_cards[group_key]["total_amount"] += b['amount']
+                
+                # --- MATEMÁTICA DE ESTORNO ---
+                # Subtrai o valor se for uma Receita (Estorno), caso contrário, soma a Despesa
+                if b.get('type', 'DESPESA') == 'RECEITA':
+                    grouped_cards[group_key]["total_amount"] -= b['amount']
+                else:
+                    grouped_cards[group_key]["total_amount"] += b['amount']
+                    
                 grouped_cards[group_key]["items"].append(b)
                 if b['is_overdue']: grouped_cards[group_key]["is_overdue"] = True
             else:
@@ -739,7 +750,9 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                     keyboard.append([InlineKeyboardButton("   💸 Pagar Fatura Fechada", callback_data=f"fatgroup_{card['bank']}_{safe_var}_{target_month}")])
                     for item in card['items']:
                         item_icon = "🔴" if item['is_overdue'] else "🔸"
-                        child_text = f"   ↳ {item_icon} {item['location'][:12]} | R$ {fmt_money(item['amount'])}"
+                        is_income = item.get('type', 'DESPESA') == 'RECEITA'
+                        sign = "-" if is_income else "" # Sinal visual de abate na fatura
+                        child_text = f"   ↳ {item_icon} {item['location'][:12]} | {sign}R$ {fmt_money(item['amount'])}"
                         keyboard.append([InlineKeyboardButton(child_text, callback_data=f"fatura_{item['id']}_{target_month}")])
 
             for b in standalone_bills:
@@ -878,8 +891,15 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
         text += "_Nenhuma movimentação neste mês._"
     else:
         text += "```text\n"
+
+        def get_effective_date(tx):
+            d_str = tx['payment_date'] if tx['status'] == 'PAID' and tx['payment_date'] else tx['due_date']
+            try: return datetime.strptime(d_str, "%d/%m/%Y")
+            except: return datetime.min
+
+        transactions.sort(key=get_effective_date)
         
-        for t in transactions[:30]:
+        for t in transactions[-30:]:
             is_income = t['type'] == 'RECEITA'
             is_paid = t['status'] == 'PAID'
             
@@ -904,7 +924,8 @@ async def show_cash_flow_month(update: Update, context: ContextTypes.DEFAULT_TYP
             text += line + "\n"
 
         text += "```\n"
-        if len(transactions) > 30: text += f"_...e mais {len(transactions) - 30} transações._\n"
+        if len(transactions) > 30: 
+            text += f"_...e outras {len(transactions) - 30} transações antigas ocultas._\n"
         text += "_( * ) = Lançamento Previsto/Pendente_\n"
 
     target_dt = datetime.strptime(target_month, "%m/%Y")
@@ -1168,8 +1189,8 @@ async def handle_inline_button(update: Update, context: ContextTypes.DEFAULT_TYP
         if is_income:
             keyboard = [
                 ["Pix", "Conta Corrente/Poupança"], 
-                ["Cartão de Benefício", "Dinheiro"],
-                ["🔄 Manter Método Original"]
+                ["Cartão de Crédito (Estorno)", "Dinheiro"],
+                ["Cartão de Benefício", "🔄 Manter Método Original"]
             ]
             text = "💸 *Onde este valor entrou?*"
         else:

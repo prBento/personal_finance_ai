@@ -719,6 +719,7 @@ def get_max_pending_month():
 def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, custom_paid_amount=None):
     """
     Paga todas as faturas do cartão e realoca os meses das parcelas para o mês de pagamento (Caixa).
+    Agora suporta Estornos (RECEITAS atreladas ao cartão), abatendo o valor líquido da fatura.
     """
     if not db_pool: return False, "Erro de conexão."
     conn = None
@@ -728,8 +729,9 @@ def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, cu
         pay_date = parse_br_date(payment_date_str)
         pay_month_str = pay_date.strftime("%m/%Y")
         
+        # 1. Traz o 'transaction_type' para separar Despesas de Estornos (Receitas)
         cursor.execute("""
-            SELECT i.id, i.amount, i.transaction_id 
+            SELECT i.id, i.amount, i.transaction_id, t.transaction_type 
             FROM installments i 
             JOIN transactions t ON i.transaction_id = t.id
             WHERE i.month = %s AND i.payment_status = 'PENDING' 
@@ -739,14 +741,26 @@ def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, cu
         installments = cursor.fetchall()
         if not installments: return False, "Nenhuma fatura pendente encontrada."
         
-        total_original_amount = sum(float(row[1]) for row in installments)
-        final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else total_original_amount
-        total_discount = total_original_amount - final_paid_amount
-        discount_ratio = total_discount / total_original_amount if total_original_amount > 0 else 0
+        # 2. Separação Matemática: Despesas vs Estornos
+        total_despesas = sum(float(row[1]) for row in installments if row[3] == 'DESPESA')
+        total_receitas = sum(float(row[1]) for row in installments if row[3] == 'RECEITA')
+        
+        total_net_amount = total_despesas - total_receitas # O valor líquido (real) da fatura
+        
+        # 3. Valor final pago (Se o usuário digitou um valor menor, calculamos o desconto)
+        final_paid_amount = float(custom_paid_amount) if custom_paid_amount is not None else total_net_amount
+        total_discount = total_net_amount - final_paid_amount
+        
+        # O desconto só pode ser distribuído proporcionalmente sobre as DESPESAS
+        discount_ratio = total_discount / total_despesas if total_despesas > 0 else 0
 
-        for inst_id, original_amt, trans_id in installments:
-            item_discount = float(original_amt) * discount_ratio
-            item_paid = float(original_amt) - item_discount
+        for inst_id, original_amt, trans_id, t_type in installments:
+            if t_type == 'DESPESA':
+                item_discount = float(original_amt) * discount_ratio
+                item_paid = float(original_amt) - item_discount
+            else:
+                item_discount = 0.0
+                item_paid = float(original_amt) # O estorno é computado 100% integralmente
             
             cursor.execute("""
                 UPDATE installments 
@@ -770,7 +784,7 @@ def pay_grouped_card_bills_in_db(month_year, bank, variant, payment_date_str, cu
                 cursor.execute("UPDATE transactions SET status = 'PAID', updated_at = CURRENT_TIMESTAMP WHERE id = %s", (trans_id,))
                 
         conn.commit()
-        return True, f"✅ Fatura inteira baixada com sucesso em {payment_date_str}!"
+        return True, f"✅ Fatura (com estornos abatidos) baixada com sucesso em {payment_date_str}!"
     except Exception as e:
         print(f"[DB ERROR] pay_grouped_card_bills: {e}")
         if conn: conn.rollback()
