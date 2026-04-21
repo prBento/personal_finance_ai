@@ -102,6 +102,8 @@ def load_installments() -> pd.DataFrame:
     df["month_dt"] = pd.to_datetime(df["month"], format="%m/%Y")
     df["year"] = df["month_dt"].dt.year.astype(str)
     df["due_date"] = pd.to_datetime(df["due_date"], errors="coerce")
+    df["real_month"] = df["due_date"].dt.strftime("%m/%Y")
+    df["real_year"] = df["due_date"].dt.year.astype(str)
     df["payment_date"] = pd.to_datetime(df["payment_date"], errors="coerce")
     df["transaction_date"] = pd.to_datetime(df["transaction_date"], errors="coerce")
 
@@ -253,12 +255,13 @@ def main():
     # ==========================================
     # --- Tabs Configuration ---
     # ==========================================
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "🎯  Saúde do Mês",
         "📈  Tendências",
         "💳  Cartões & Parcelas",
         "🔭  Projeção de Caixa",
         "🛒  Operacional — Itens",
+        "🧮  Matriz de Conferência",
     ])
 
     # ==========================================
@@ -834,6 +837,107 @@ def main():
             st.dataframe(df_view, use_container_width=True, hide_index=True)
             st.caption(f"{len(df_view)} itens exibidos — Total: {fmt_brl(df_audit['item_total'].sum())}")
 
+    # ==========================================
+    # TAB 6: MATRIZ DE CONFERÊNCIA (Audit Mode)
+    # ==========================================
+    with tab6:
+        st.subheader(f"Matriz de Conferência — {ano_sel}")
+        st.caption(
+            "Visão de competência: os lançamentos aparecem no mês do Vencimento Original. "
+            "Valores refletem o que foi efetivamente pago ou o previsto atualizado."
+        )
+        
+        # Filtro inicial pelo ano de competência (Vencimento)
+        df_matriz = df_inst[df_inst["real_year"] == ano_sel].copy()
+        
+        if df_matriz.empty:
+            st.info(f"Nenhum dado com vencimento em {ano_sel} encontrado.")
+        else:
+            # Preparação de colunas auxiliares
+            df_matriz["Cartão"] = df_matriz.apply(
+                lambda r: f"{r['card_bank']} {r['card_variant']}".strip() if r['card_bank'] else "À Vista / Pix",
+                axis=1
+            )
+
+            # --- FILTROS LOCAIS DA ABA ---
+            st.markdown("##### 🔍 Filtros de Auditoria")
+            f1, f2, f3 = st.columns(3)
+            
+            with f1:
+                locais_f = sorted(df_matriz["location_name"].unique().tolist())
+                sel_locais = st.multiselect("Filtrar por Local:", locais_f, placeholder="Todos os locais")
+            
+            with f2:
+                cartoes_f = sorted(df_matriz["Cartão"].unique().tolist())
+                sel_cartoes = st.multiselect("Filtrar por Cartão/Método:", cartoes_f, placeholder="Todos os métodos")
+                
+            with f3:
+                categorias_f = sorted(df_matriz["macro_category"].unique().tolist())
+                sel_cats = st.multiselect("Filtrar por Categoria:", categorias_f, placeholder="Todas as categorias")
+
+            # Aplicação dos filtros dinâmicos
+            if sel_locais: df_matriz = df_matriz[df_matriz["location_name"].isin(sel_locais)]
+            if sel_cartoes: df_matriz = df_matriz[df_matriz["Cartão"].isin(sel_cartoes)]
+            if sel_cats: df_matriz = df_matriz[df_matriz["macro_category"].isin(sel_cats)]
+
+            # Ordenação cronológica das colunas de meses
+            meses_colunas = sorted(
+                df_matriz["real_month"].unique().tolist(), 
+                key=lambda x: datetime.strptime(str(x), "%m/%Y")
+            )
+
+            for tx_type, label in [("RECEITA", "Receitas"), ("DESPESA", "Despesas")]:
+                st.markdown(f"### 📋 {label}")
+                df_tipo = df_matriz[df_matriz["transaction_type"] == tx_type]
+
+                if df_tipo.empty:
+                    st.write(f"_Nenhum registro de {label.lower()} encontrado com os filtros aplicados._")
+                    continue
+
+                # PIVOT TABLE: Apenas macro_category, garantindo que o valor nunca seja multiplicado
+                pivot = pd.pivot_table(
+                    df_tipo,
+                    values='real_amount',
+                    index=['macro_category', 'location_name', 'Cartão', 'transaction_id'],
+                    columns='real_month', 
+                    aggfunc='sum',
+                    fill_value=0
+                )
+
+                # Proteção anti-crash caso os filtros esvaziem a visualização
+                if pivot.empty:
+                    st.write(f"_Nenhum dado válido para exibir nesta seção._")
+                    continue
+
+                # Força todas as colunas de meses a aparecerem, preenchendo com 0 onde não há dados
+                pivot = pivot.reindex(columns=meses_colunas, fill_value=0)
+                
+                # Calcula o total anual da linha
+                pivot['Total Ano'] = pivot.sum(axis=1)
+                
+                # Tira o index agrupado para formatar como dataframe comum
+                pivot = pivot.reset_index()
+                
+                pivot.rename(columns={
+                    'macro_category': 'Categoria',
+                    'location_name': 'Estabelecimento / Origem',
+                    'transaction_id': 'Ref. ID'
+                }, inplace=True)
+
+                pivot = pivot.sort_values(by=['Categoria', 'Estabelecimento / Origem'])
+
+                # Formatação Monetária Interativa
+                for col in meses_colunas + ['Total Ano']:
+                    pivot[col] = pivot[col].apply(
+                        lambda x: f"R$ {x:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if x != 0 else "-"
+                    )
+
+                st.dataframe(
+                    pivot, 
+                    use_container_width=True, 
+                    hide_index=True,
+                    height=500 if tx_type == "DESPESA" else 300
+                )
 
 if __name__ == "__main__":
     main()
