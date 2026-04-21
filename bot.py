@@ -173,11 +173,11 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     # Generate the payload for PostgreSQL insertion
     for i in range(actual_installments):
         installment_date = base_date + relativedelta(months=i)
-    
+        # Determine Status: Refunds to credit cards stay PENDING. Cash/Immediate payments check the date.
         if str(transaction_type).upper() == "RECEITA" and is_credit_card:
-            inst_status = "PENDING"
+            inst_status = "PENDING" 
         elif (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str:
-            # Se a data dessa parcela já chegou, consideramos pago. Meses futuros ficam pendentes!
+            # If the installment date has already passed, consider it PAID. Future months remain PENDING!
             if installment_date.date() <= today_dt.date():
                 inst_status = "PAID"
             else:
@@ -275,39 +275,53 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                 if check_similar_transaction(loc_check, float(tx.get("valor_total") or 0.0), tx.get("dt_transacao") or today_str):
                     tx["alerta_duplicidade"] = True
 
-            # --- CODE-FORCED MATH & DISCOUNT FALLBACK ---
-            # --- LLM RECURRENCE SANITIZER ---
+            # --- LLM RECURRENCE SANITIZER (HYBRID HEURISTICS) ---
             is_rec = tx.get("recorrente", False)
             if is_rec:
                 qtd_meses = int(tx.get("quantidade_parcelas") or 1)
                 val_t = float(tx.get("valor_total") or 0.0)
 
-                # Heurística 1: a IA colocou os meses na "quantidade" do item
+                # Heuristic 1: Rescue lost month quantities
                 if qtd_meses <= 1:
+                    # Try to find it in the items list first
                     for it in tx.get("itens", []):
                         if float(it.get("quantidade", 1)) > 1:
                             qtd_meses = int(float(it["quantidade"]))
                             it["quantidade"] = 1.0
                             break
+                    # Bulletproof fallback: Hunt for "6x" or "5 months" directly in the original text
+                    if qtd_meses <= 1:
+                        match = re.search(r'(\d+)\s*(?:x|vezes|meses)', text_to_process.lower())
+                        if match:
+                            qtd_meses = int(match.group(1))
+
                 tx["quantidade_parcelas"] = max(1, qtd_meses)
 
-                # Heurística 2: detecta se val_t ou v_unit foi multiplicado pela IA
-                # Princípio: o valor mensal é SEMPRE o menor entre os dois quando
-                # um é múltiplo exato do outro.
+                # Heuristic 2: Mathematical Paradox Correction
                 if qtd_meses > 1 and len(tx.get("itens", [])) == 1:
                     it = tx["itens"][0]
                     v_unit = float(it.get("valor_unitario", 0.0))
 
                     if v_unit > 0 and val_t > 0:
-                        # Caso A: IA multiplicou o total (val_t = v_unit * N)
-                        if abs(val_t - round(v_unit * qtd_meses, 2)) < 1.0:
-                            val_t = v_unit  # o unitário está correto; descarta o total inflado
+                        val_dividido = round(val_t / qtd_meses, 2)
+                        
+                        # Extract numbers from the original text for the ground truth test
+                        numeros_texto = []
+                        for n in re.findall(r'\d+(?:[.,]\d+)?', text_to_process):
+                            try: numeros_texto.append(float(n.replace(',', '.')))
+                            except: pass
 
-                        # Caso B: IA dividiu o unitário (v_unit = val_t / N)
-                        elif abs(v_unit - round(val_t / qtd_meses, 2)) < 1.0:
-                            pass  # val_t já é o mensal correto; v_unit será corrigido abaixo
+                        # If the AI injected the inflated value (e.g., 15000) into BOTH Total and Unitary
+                        if val_dividido in numeros_texto and val_t not in numeros_texto:
+                            val_t = val_dividido
+                        # Original Case A: AI multiplied the total (Total = Unit * N)
+                        elif abs(val_t - round(v_unit * qtd_meses, 2)) < 1.0:
+                            val_t = v_unit  
+                        # Original Case B: AI divided the unit (Unit = Total / N)
+                        elif abs(v_unit - val_dividido) < 1.0:
+                            pass 
 
-                # Força tudo para o valor mensal correto
+                # Force everything to the correct monthly value
                 monthly = val_t
                 tx["valor_total"]    = monthly
                 tx["valor_original"] = monthly
@@ -338,7 +352,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
             raw_dt = str(tx.get("dt_transacao", "")).strip()
             if re.match(r'^\d{2}/\d{2}$', raw_dt):
                 tx["dt_transacao"] = f"{raw_dt}/{datetime.now(timezone(timedelta(hours=-3))).year}"
-            elif not raw_dt or raw_dt.lower() == "null" or len(raw_dt) < 5:
+            elif not raw_dt or raw_dt.lower() in ["null", "none", "não informado", "nao informado"] or len(raw_dt) < 5:
                 tx["dt_transacao"] = today_str
             
             for idx, it in enumerate(tx.get("itens", []), start=1):
@@ -564,7 +578,6 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
         is_recurring = tx.get("recorrente", False)
         is_credit_card = "crédito" in method or "credito" in method
         
-        # Pula a pergunta se for recorrência no CARTÃO (o bot já sabe calcular a fatura)
         needs_first_date = ("financiamento" in method or (parcels > 1 and "boleto" in method) or is_recurring) and not is_credit_card
         
         if needs_first_date and not user_data.get("primeira_parcela_definida"):
@@ -593,11 +606,11 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
         tx["parcelado"] = False
         qtd_meses = 1
 
-    # --- MOTOR DE EXPANSÃO DE RECORRÊNCIA ---
-    # Recorrente ≠ Parcelado. Transforma 1 JSON com N meses em N JSONs independentes.
+    # --- RECURRENCE EXPANSION ENGINE ---
+    # Recurrent ≠ Installment. Transforms 1 JSON with N months into N independent JSONs.
     if is_recurring and qtd_meses > 1:
         monthly_value = float(tx.get("valor_total") or 0.0)
-        # Se for cartão, usa a data da compra. Se for Pix/Boleto, usa a data que o usuário informou.
+        # If it's a card, use the purchase date. If it's Pix/Boleto, use the user-provided date.
         first_date_str = user_data.get("primeira_parcela_definida") or tx.get("dt_transacao")
         
         try:
@@ -608,15 +621,15 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
         expanded_transactions = []
         for i in range(qtd_meses):
             month_date = first_date + relativedelta(months=i)
-            new_tx = json.loads(json.dumps(tx)) # Deep copy para não afetar os outros meses
+            new_tx = json.loads(json.dumps(tx)) # Deep copy to avoid affecting other months
             
             new_tx["dt_transacao"] = month_date.strftime("%d/%m/%Y")
             new_tx["numero_nota"] = f"REC-{random.randint(100000, 999999)}"
             new_tx["quantidade_parcelas"] = 1
-            new_tx["parcelado"] = False # Recorrência não é parcelamento
-            new_tx["recorrente"] = False # Já está individualizada
+            new_tx["parcelado"] = False # Recurrence is not an installment
+            new_tx["recorrente"] = False # It is already individualized
             
-            # Cada mês agora ganha sua própria inteligência de vencimento (fatura do cartão, etc)
+            # Each month now gets its own due date intelligence (credit card invoice, etc.)
             new_tx["detalhamento_parcelas"] = generate_installment_details(
                 monthly_value, 
                 1, 
@@ -628,11 +641,11 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
             )
             expanded_transactions.append(new_tx)
 
-        # Atualiza a sessão com a lista de transações independentes
+        # Updates the session with the list of independent transactions
         user_data["transacao_pendente_json"]["transacoes"] = expanded_transactions
-        tx = expanded_transactions[0] # Usamos a primeira para exibir o resumo na tela
+        tx = expanded_transactions[0] # We use the first one to display the summary on the screen
     else:
-        # Fluxo normal para compras únicas ou parcelamentos tradicionais
+        # Normal flow for single purchases or traditional installments
         tx["detalhamento_parcelas"] = generate_installment_details(
             float(tx.get("valor_total") or 0.0), 
             int(tx.get("quantidade_parcelas") or 1), 
@@ -645,9 +658,10 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
 
     user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
     
+    tx_date = tx.get("dt_transacao", datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y"))
     # --- UI: Markdown Summary Building ---
     cat = tx.get("categoria_macro", "Não classificada")
-    parcels_display = qtd_meses # Variável intocada para o display
+    parcels_display = qtd_meses # Untouched variable for display purposes
     
     summary = f"📈 *Resumo*\n🏢 *Origem:* {loc_name}\n📅 *Data:* {tx_date}\n" if tx_type == "RECEITA" else f"🛒 *Resumo*\n📍 *Local:* {loc_name}\n📅 *Data:* {tx_date}\n"
     summary += f"🏷️ *Categoria:* {cat}\n"
@@ -768,8 +782,8 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 if group_key not in grouped_cards:
                     grouped_cards[group_key] = {"bank": b['bank'], "variant": b['variant'], "total_amount": 0.0, "items": [], "is_overdue": False}
                 
-                # --- MATEMÁTICA DE ESTORNO ---
-                # Subtrai o valor se for uma Receita (Estorno), caso contrário, soma a Despesa
+                # --- REFUND MATH ---
+                # Subtracts the value if it's an Income (Refund); otherwise, adds the Expense
                 if b.get('type', 'DESPESA') == 'RECEITA':
                     grouped_cards[group_key]["total_amount"] -= b['amount']
                 else:

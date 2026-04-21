@@ -97,7 +97,7 @@ ESTRUTURA DO JSON FINAL:
       "itens": [
         {
           "numero_item_nota": null, 
-          "item": "Nome genérico do produto", 
+          "item": "Nome", 
           "codigo_produto": "Código ou null",
           "marca": "Apenas a marca do produto ou null", 
           "valor_unitario": 0.00, 
