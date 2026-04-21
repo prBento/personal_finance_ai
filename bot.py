@@ -169,39 +169,37 @@ def generate_installment_details(total_amount, total_installments, transaction_d
     cash_keywords = ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança", "benefício", "pré-pago"]
     is_cash_payment = any(word in method_str for word in cash_keywords)
     is_credit_card = "crédito" in method_str or "credito" in method_str
-    
-    if str(transaction_type).upper() == "RECEITA" and is_credit_card:
-        payment_status = "PENDING"
-    else:
-        payment_status = "PAID" if (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str else "PENDING"
-    
-    # --- CASH BASIS REALLOCATION LOGIC ---
-    if payment_status == "PAID":
-        # If paid today, but the extracted invoice date is in the future, lock the real payment date to today.
-        if tx_date > today_dt:
-            real_pay_date = today_dt
-        else:
-            real_pay_date = tx_date
-            
-        date_paid_str = real_pay_date.strftime("%d/%m/%Y")
-        base_payment_month = real_pay_date.strftime("%m/%Y")
-    else:
-        date_paid_str = None
-        base_payment_month = None
-
-    paid_value = installment_value if payment_status == "PAID" else 0.0
 
     # Generate the payload for PostgreSQL insertion
     for i in range(actual_installments):
         installment_date = base_date + relativedelta(months=i)
-        
-        # If Paid, force the installment month to match the real payment month to align with the Cash Flow Ledger (Extrato)
-        assigned_month = base_payment_month if payment_status == "PAID" else installment_date.strftime("%m/%Y")
-        
+        # Determine Status: Refunds to credit cards stay PENDING. Cash/Immediate payments check the date.
+        if str(transaction_type).upper() == "RECEITA" and is_credit_card:
+            inst_status = "PENDING" 
+        elif (is_cash_payment or str(transaction_type).upper() == "RECEITA") and "aberto" not in method_str and "pendente" not in method_str:
+            # If the installment date has already passed, consider it PAID. Future months remain PENDING!
+            if installment_date.date() <= today_dt.date():
+                inst_status = "PAID"
+            else:
+                inst_status = "PENDING"
+        else:
+            inst_status = "PENDING"
+    
+    # --- CASH BASIS REALLOCATION LOGIC ---
+        if inst_status == "PAID":
+            real_pay_date = today_dt if installment_date > today_dt else installment_date
+            date_paid_str = real_pay_date.strftime("%d/%m/%Y")
+            assigned_month = real_pay_date.strftime("%m/%Y")
+            paid_value = installment_value
+        else:
+            date_paid_str = None
+            assigned_month = installment_date.strftime("%m/%Y")
+            paid_value = 0.0
+
         details.append({
             "mes": assigned_month, 
             "data_vencimento": installment_date.strftime("%d/%m/%Y"), 
-            "valor": installment_value, "status_pagamento": payment_status,
+            "valor": installment_value, "status_pagamento": inst_status,
             "dt_pagamento": date_paid_str, "valor_pago": paid_value
         })
     return details
@@ -277,26 +275,76 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                 if check_similar_transaction(loc_check, float(tx.get("valor_total") or 0.0), tx.get("dt_transacao") or today_str):
                     tx["alerta_duplicidade"] = True
 
+            # --- LLM RECURRENCE SANITIZER (HYBRID HEURISTICS) ---
+            is_rec = tx.get("recorrente", False)
+            if is_rec:
+                qtd_meses = int(tx.get("quantidade_parcelas") or 1)
+                val_t = float(tx.get("valor_total") or 0.0)
+
+                # Heuristic 1: Rescue lost month quantities
+                if qtd_meses <= 1:
+                    # Try to find it in the items list first
+                    for it in tx.get("itens", []):
+                        if float(it.get("quantidade", 1)) > 1:
+                            qtd_meses = int(float(it["quantidade"]))
+                            it["quantidade"] = 1.0
+                            break
+                    # Bulletproof fallback: Hunt for "6x" or "5 months" directly in the original text
+                    if qtd_meses <= 1:
+                        match = re.search(r'(\d+)\s*(?:x|vezes|meses)', text_to_process.lower())
+                        if match:
+                            qtd_meses = int(match.group(1))
+
+                tx["quantidade_parcelas"] = max(1, qtd_meses)
+
+                # Heuristic 2: Mathematical Paradox Correction
+                if qtd_meses > 1 and len(tx.get("itens", [])) == 1:
+                    it = tx["itens"][0]
+                    v_unit = float(it.get("valor_unitario", 0.0))
+
+                    if v_unit > 0 and val_t > 0:
+                        val_dividido = round(val_t / qtd_meses, 2)
+                        
+                        # Extract numbers from the original text for the ground truth test
+                        numeros_texto = []
+                        for n in re.findall(r'\d+(?:[.,]\d+)?', text_to_process):
+                            try: numeros_texto.append(float(n.replace(',', '.')))
+                            except: pass
+
+                        # If the AI injected the inflated value (e.g., 15000) into BOTH Total and Unitary
+                        if val_dividido in numeros_texto and val_t not in numeros_texto:
+                            val_t = val_dividido
+                        # Original Case A: AI multiplied the total (Total = Unit * N)
+                        elif abs(val_t - round(v_unit * qtd_meses, 2)) < 1.0:
+                            val_t = v_unit  
+                        # Original Case B: AI divided the unit (Unit = Total / N)
+                        elif abs(v_unit - val_dividido) < 1.0:
+                            pass 
+
+                # Force everything to the correct monthly value
+                monthly = val_t
+                tx["valor_total"]    = monthly
+                tx["valor_original"] = monthly
+                for it in tx.get("itens", []):
+                    it["valor_unitario"] = monthly
+                    it["quantidade"]     = 1.0
+
             # --- CODE-FORCED MATH & DISCOUNT FALLBACK ---
-            # LLMs are notoriously bad at math. This block recalculates the invoice totals manually.
             val_total = float(tx.get("valor_total") or 0.0)
             
-            # 1. Calculates the true gross total directly from the items
+            # Calculates the true gross total directly from the items
             sum_items = round(sum(float(i.get("valor_unitario", 0)) * float(i.get("quantidade", 1)) for i in tx.get("itens", [])), 2)
             
-            # 2. Fixes zeroed totals
+            # Fixes zeroed totals
             if val_total == 0.0 and sum_items > 0:
                 val_total = sum_items
                 tx["valor_total"] = val_total
                 
-            # 3. Hidden Discount Detector
-            # If the mathematical sum of the items is greater than the total invoice value, 
-            # we have a discount that the LLM missed.
+            # Hidden Discount Detector
             if sum_items > val_total > 0:
                 calc_discount = round(sum_items - val_total, 2)
                 current_discount = float(tx.get("desconto_aplicado") or 0.0)
                 
-                # Overwrites LLM hallucination with hard code math
                 if calc_discount > current_discount:
                     tx["valor_original"] = sum_items
                     tx["desconto_aplicado"] = calc_discount
@@ -304,7 +352,7 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
             raw_dt = str(tx.get("dt_transacao", "")).strip()
             if re.match(r'^\d{2}/\d{2}$', raw_dt):
                 tx["dt_transacao"] = f"{raw_dt}/{datetime.now(timezone(timedelta(hours=-3))).year}"
-            elif not raw_dt or raw_dt.lower() == "null" or len(raw_dt) < 5:
+            elif not raw_dt or raw_dt.lower() in ["null", "none", "não informado", "nao informado"] or len(raw_dt) < 5:
                 tx["dt_transacao"] = today_str
             
             for idx, it in enumerate(tx.get("itens", []), start=1):
@@ -525,56 +573,118 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
                     )
                 return
 
-        # Step 4: Validate Target Date for long-term debts
+        # Step 4: Validate Target Date for long-term debts and recurrences
         parcels = int(tx.get("quantidade_parcelas") or 1)
-        needs_first_date = "financiamento" in method or (parcels > 1 and "boleto" in method)
+        is_recurring = tx.get("recorrente", False)
+        is_credit_card = "crédito" in method or "credito" in method
+        
+        needs_first_date = ("financiamento" in method or (parcels > 1 and "boleto" in method) or is_recurring) and not is_credit_card
+        
         if needs_first_date and not user_data.get("primeira_parcela_definida"):
             user_data["estado"] = "AGUARDANDO_DATA_PRIMEIRA_PARCELA"
-            await bot.send_message(chat_id, f"📅 Qual a *Data de Vencimento da 1ª Parcela*?\n*(As outras {parcels-1} parcelas cairão no mesmo dia nos meses seguintes)*\n\nExemplo: `15/05/2026`", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+            label = "do 1º Lançamento" if is_recurring else "da 1ª Parcela"
+            await bot.send_message(chat_id, f"📅 Qual a *Data de Vencimento {label}*?\n*(As outras {parcels-1} cairão no mesmo dia nos meses seguintes)*", parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
             return
 
-     # --- ALL CASCADES PASSED: Generate Final Parsing ---
+    # --- ALL CASCADES PASSED: Generate Final Parsing ---
     db_card = get_card_from_db(bank, variant) if bank else None
     is_prepaid = db_card and db_card.get("closing") == 0 and db_card.get("due") == 0
     is_cash = method in ["débito", "debito", "pix", "dinheiro", "conta corrente", "poupança"]
     
-    if is_prepaid or is_cash or tx_type == "RECEITA":
+    is_installment = tx.get("parcelado", False)
+    is_recurring = tx.get("recorrente", False)
+    qtd_meses = int(tx.get("quantidade_parcelas") or 1)
+
+    if is_prepaid:
         tx["quantidade_parcelas"] = 1
         tx["parcelado"] = False
-        if is_prepaid and ("crédito" in method or "credito" in method):
+        if ("crédito" in method or "credito" in method):
             tx["metodo_pagamento"] = "Cartão de Benefício/Pré-pago"
             method = "benefício"
+    elif (is_cash or tx_type == "RECEITA") and not (is_recurring or is_installment):
+        tx["quantidade_parcelas"] = 1
+        tx["parcelado"] = False
+        qtd_meses = 1
 
-    tx["detalhamento_parcelas"] = generate_installment_details(
-        float(tx.get("valor_total") or 0.0), 
-        int(tx.get("quantidade_parcelas") or 1), 
-        tx.get("dt_transacao"), 
-        db_card, 
-        method, 
-        tx_type,
-        first_inst_date=user_data.get("primeira_parcela_definida")
-    )
+    # --- RECURRENCE EXPANSION ENGINE ---
+    # Recurrent ≠ Installment. Transforms 1 JSON with N months into N independent JSONs.
+    if is_recurring and qtd_meses > 1:
+        monthly_value = float(tx.get("valor_total") or 0.0)
+        # If it's a card, use the purchase date. If it's Pix/Boleto, use the user-provided date.
+        first_date_str = user_data.get("primeira_parcela_definida") or tx.get("dt_transacao")
+        
+        try:
+            first_date = datetime.strptime(first_date_str, "%d/%m/%Y")
+        except:
+            first_date = datetime.now(timezone(timedelta(hours=-3)))
+
+        expanded_transactions = []
+        for i in range(qtd_meses):
+            month_date = first_date + relativedelta(months=i)
+            new_tx = json.loads(json.dumps(tx)) # Deep copy to avoid affecting other months
+            
+            new_tx["dt_transacao"] = month_date.strftime("%d/%m/%Y")
+            new_tx["numero_nota"] = f"REC-{random.randint(100000, 999999)}"
+            new_tx["quantidade_parcelas"] = 1
+            new_tx["parcelado"] = False # Recurrence is not an installment
+            new_tx["recorrente"] = False # It is already individualized
+            
+            # Each month now gets its own due date intelligence (credit card invoice, etc.)
+            new_tx["detalhamento_parcelas"] = generate_installment_details(
+                monthly_value, 
+                1, 
+                new_tx["dt_transacao"], 
+                db_card, 
+                method, 
+                tx_type, 
+                first_inst_date=None
+            )
+            expanded_transactions.append(new_tx)
+
+        # Updates the session with the list of independent transactions
+        user_data["transacao_pendente_json"]["transacoes"] = expanded_transactions
+        tx = expanded_transactions[0] # We use the first one to display the summary on the screen
+    else:
+        # Normal flow for single purchases or traditional installments
+        tx["detalhamento_parcelas"] = generate_installment_details(
+            float(tx.get("valor_total") or 0.0), 
+            int(tx.get("quantidade_parcelas") or 1), 
+            tx.get("dt_transacao"), 
+            db_card, 
+            method, 
+            tx_type,
+            first_inst_date=user_data.get("primeira_parcela_definida")
+        )
+
     user_data["estado"] = "AGUARDANDO_CONFIRMACAO"
     
+    tx_date = tx.get("dt_transacao", datetime.now(timezone(timedelta(hours=-3))).strftime("%d/%m/%Y"))
     # --- UI: Markdown Summary Building ---
     cat = tx.get("categoria_macro", "Não classificada")
-    parcels = int(tx.get("quantidade_parcelas") or 1)
+    parcels_display = qtd_meses # Untouched variable for display purposes
     
     summary = f"📈 *Resumo*\n🏢 *Origem:* {loc_name}\n📅 *Data:* {tx_date}\n" if tx_type == "RECEITA" else f"🛒 *Resumo*\n📍 *Local:* {loc_name}\n📅 *Data:* {tx_date}\n"
     summary += f"🏷️ *Categoria:* {cat}\n"
     
-    discount_app = float(tx.get('desconto_aplicado') or 0.0)
-    if discount_app > 0:
-        summary += f"💰 *Valor Bruto:* R$ {float(tx.get('valor_original') or 0):.2f}\n"
-        summary += f"✂️ *Desconto:* -R$ {discount_app:.2f}\n"
-        summary += f"💵 *Valor Final:* R$ {float(tx.get('valor_total') or 0):.2f}\n"
+    if is_recurring:
+        val_mensal = float(tx.get('valor_total') or 0.0)
+        total_proj = val_mensal * parcels_display
+        summary += f"💰 *Valor Mensal:* R$ {val_mensal:.2f}\n"
+        summary += f"🔁 *Duração:* {parcels_display} meses (Total Projetado: R$ {total_proj:.2f})\n"
     else:
-        summary += f"💰 *Valor:* R$ {float(tx.get('valor_total') or 0):.2f}\n"
+        discount_app = float(tx.get('desconto_aplicado') or 0.0)
+        val_total = float(tx.get('valor_total') or 0.0)
+        if discount_app > 0:
+            summary += f"💰 *Valor Bruto:* R$ {float(tx.get('valor_original') or 0):.2f}\n"
+            summary += f"✂️ *Desconto:* -R$ {discount_app:.2f}\n"
+            summary += f"💵 *Valor Final:* R$ {val_total:.2f}\n"
+        else:
+            summary += f"💰 *Valor:* R$ {val_total:.2f}\n"
         
     summary += f"💳 *Método:* {tx.get('metodo_pagamento')}"
     summary += f" ({bank} {variant})\n" if bank else "\n"
     
-    if tx_type != "RECEITA": summary += f"📅 *Parcelas:* {parcels}x\n\n"
+    if is_installment and tx_type != "RECEITA": summary += f"📅 *Parcelas:* {parcels_display}x\n\n"
     else: summary += "\n"
     
     items_list = tx.get("itens", [])
@@ -594,10 +704,20 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
         
     summary_title = "*Previsão de Entrada:*\n" if tx_type == "RECEITA" else "*Vencimentos:*\n"
     summary += summary_title
-    for p in tx.get("detalhamento_parcelas", [])[:3]:
-        icon = "✅" if p['status_pagamento'] == 'PAID' else "🔹"
-        summary += f"{icon} {p['data_vencimento']} - R$ {float(p.get('valor') or 0):.2f}\n"
-    if parcels > 3: summary += f"...e mais {parcels - 3} parcelas.\n"
+    
+    if is_recurring:
+        # Puxa as datas das 3 primeiras transações expandidas
+        for exp_tx in user_data["transacao_pendente_json"]["transacoes"][:3]:
+            p = exp_tx.get("detalhamento_parcelas", [{}])[0]
+            if p:
+                icon = "✅" if p.get('status_pagamento') == 'PAID' else "🔹"
+                summary += f"{icon} {p.get('data_vencimento')} - R$ {float(p.get('valor') or 0):.2f}\n"
+        if parcels_display > 3: summary += f"...e mais {parcels_display - 3} meses.\n"
+    else:
+        for p in tx.get("detalhamento_parcelas", [])[:3]:
+            icon = "✅" if p['status_pagamento'] == 'PAID' else "🔹"
+            summary += f"{icon} {p['data_vencimento']} - R$ {float(p.get('valor') or 0):.2f}\n"
+        if parcels_display > 3: summary += f"...e mais {parcels_display - 3} parcelas.\n"
         
     summary += f"\n📋 *ID:* `{tx.get('numero_nota')}`\n"
     if tx.get("alerta_duplicidade"): summary += f"\n🚨 *ALERTA DE DUPLICIDADE:* Registro idêntico encontrado hoje!\n\n⚠️ *Deseja salvar NOVAMENTE?*"
@@ -662,8 +782,8 @@ async def show_bills_month(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 if group_key not in grouped_cards:
                     grouped_cards[group_key] = {"bank": b['bank'], "variant": b['variant'], "total_amount": 0.0, "items": [], "is_overdue": False}
                 
-                # --- MATEMÁTICA DE ESTORNO ---
-                # Subtrai o valor se for uma Receita (Estorno), caso contrário, soma a Despesa
+                # --- REFUND MATH ---
+                # Subtracts the value if it's an Income (Refund); otherwise, adds the Expense
                 if b.get('type', 'DESPESA') == 'RECEITA':
                     grouped_cards[group_key]["total_amount"] -= b['amount']
                 else:
