@@ -908,7 +908,7 @@ def main():
             st.caption(f"{len(df_view)} itens exibidos — Total: {fmt_brl(df_audit['item_total'].sum())}")
 
     # ==========================================
-    # TAB 6: MATRIZ DE CONFERÊNCIA (Audit Mode)
+    # TAB 6: CONFERENCE MATRIX (Audit Mode)
     # ==========================================
     with tab6:
         st.subheader(f"Matriz de Conferência — {ano_sel}")
