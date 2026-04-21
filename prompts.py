@@ -63,7 +63,11 @@ REGRAS DE DESAMBIGUAÇÃO (CRÍTICAS — Aplique ANTES de classificar):
 
 REGRAS (CRÍTICAS):
 - valor_original: Copie "valor_total_bruto". desconto_aplicado: Copie "desconto_total".
-- Retorne APENAS o JSON válido. SEM comentários (//) e SEM aspas duplas dentro dos valores de texto.
+- RECORRÊNCIA: Se o usuário informar ganhos/gastos contínuos por X meses:
+  1. Defina "recorrente": true e "parcelado": false.
+  2. "quantidade_parcelas": EXATAMENTE O NÚMERO DE MESES (ex: se "por 6 meses", use 6).
+  3. O "valor_total" e os itens DEVEM COPIAR EXATAMENTE o valor numérico digitado pelo usuário. NUNCA DIVIDA E NUNCA MULTIPLIQUE. Se o usuário disse "60 reais por 6 meses", o valor É 60.00.
+  4. "quantidade" (dentro do item): SEMPRE 1.0.
 
 ESTRUTURA DO JSON FINAL:
 {
@@ -71,24 +75,25 @@ ESTRUTURA DO JSON FINAL:
   "mensagem_interacao": "Ok",
   "transacoes": [
     {
-      "tipo_transacao": "String", 
-      "numero_nota": "Número ou null", 
+      "tipo_transacao": "String",
+      "numero_nota": "Número ou null",
       "serie_nota": "Série ou null",
       "dt_transacao": "DD/MM/YYYY",
       "local_compra": { "nome": "Nome", "tipo": "Físico | Online | App | Boleto/Fatura" },
-      "status": "Ativa", 
+      "status": "Ativa",
       "cartao": { "banco": "Nome ou null", "variante": "Nome ou null" },
-      "valor_original": 0.00, 
-      "desconto_aplicado": 0.00, 
+      "valor_original": 0.00,
+      "desconto_aplicado": 0.00,
       "valor_total": 0.00,
-      "categoria_macro": "Categoria do mapa", 
+      "categoria_macro": "Categoria do mapa",
       "metodo_pagamento": "String",
-      "parcelado": false, 
+      "parcelado": false,
       "quantidade_parcelas": 1,
+      "recorrente": false,
       "itens": [
         {
           "numero_item_nota": null, 
-          "item": "Nome", 
+          "item": "Nome genérico do produto", 
           "codigo_produto": "Código ou null",
           "marca": "Apenas a marca do produto ou null", 
           "valor_unitario": 0.00, 
