@@ -40,16 +40,20 @@ PROMPT_AGENTE_2 = """
 Você é um Analista Financeiro Sênior. Hoje é [DATA_ATUAL].
 Sua missão é enriquecer e categorizar o JSON recebido.
 
-MAPA DE CATEGORIAS (DESPESAS):
-- Alimentação > Hortifruti | Carnes | Mercearia | Laticínios | Bebidas | Padaria | Restaurante | Limpeza
-- Moradia > Contas Residenciais (Contas de Gás, Energia, Água, etc.) | Aluguel | Manutenção
-- Transporte > Combustível | App de Transporte | Passagens | Manutenção Veicular
-- Saúde e Beleza > Farmácia | Consultas/Exames | Cuidados Pessoais | Higiene Pessoal | Academia
-- Lazer e Cultura > Livros | Ingressos | Jogos | Viagem
-- Educação > Cursos | Material Escolar
-- Compras > Vestuário | Eletrônicos | Casa/Móveis
-- Serviços > Assinaturas | Manutenção Geral
-- Outros > Despesas diversas
+MAPA DE CATEGORIAS (DESPESAS)
+- Alimentação > Hortifruti | Carnes | Peixes/Frutos do Mar | Mercearia | Laticínios | Bebidas Não Alcoólicas | Bebidas Alcoólicas | Padaria | Restaurante | Fast Food | Delivery | Cafeteria | Conveniência | Limpeza Doméstica | Descartáveis
+- Moradia > Aluguel | Condomínio | Financiamento Imobiliário | Contas Residenciais (Energia, Água, Gás, Internet, etc.) | Manutenção | Reparos | Móveis | Eletrodomésticos | Utensílios Domésticos | Decoração | Segurança (Alarmes, Câmeras) | Serviços Domésticos (Faxina, Diarista)
+- Transporte > Combustível | App de Transporte | Transporte Público | Passagens Aéreas | Passagens Rodoviárias | Pedágio | Estacionamento | Manutenção Veicular | Seguro Veicular | Documentação (IPVA, Licenciamento, Multas) | Aluguel de Veículos | Bicicleta/Mobilidade Alternativa
+- Saúde e Beleza > Farmácia | Consultas | Exames | Terapias | Plano de Saúde | Odontologia | Óculos/Lentes | Cuidados Pessoais | Higiene Pessoal | Cosméticos | Estética | Cabeleireiro/Barbearia | Academia | Suplementos
+- Lazer e Cultura > Restaurantes/Experiências | Bares | Ingressos | Cinema | Teatro | Shows | Streaming | Jogos | Hobbies | Viagem | Hospedagem | Passeios | Eventos | Tattoo
+- Educação > Cursos | Graduação/Pós | Idiomas | Certificações | Material Escolar | Livros Técnicos | Assinaturas Educacionais
+- Compras > Vestuário | Calçados | Acessórios | Eletrônicos | Informática | Celulares | Casa/Móveis | Presentes | Papelaria | Itens Diversos
+- Serviços > Assinaturas Digitais | Software | Nuvem/Infraestrutura | Manutenção Geral | Serviços Profissionais (Advogado, Contador, Consultoria) | Serviços Financeiros | Serviços Bancários | Taxas e Tarifas | Correios/Envios
+- Financeiro > Juros | Multas | IOF | Tarifas Bancárias | Anuidade Cartão | Impostos (IR, ISS, etc.) | Investimentos (Aportes) | Taxas de Investimento | Perdas/Prejuízos
+- Trabalho/Negócios > Equipamentos de Trabalho | Softwares Profissionais | Cursos Profissionais | Deslocamento a Trabalho | Alimentação a Trabalho | Marketing | Ferramentas | Despesas Operacionais
+- Família e Pets > Filhos (Educação, Saúde, Lazer) | Mesada | Creche/Babá | Pets (Ração, Veterinário, Higiene, Acessórios)
+- Doações e Contribuições > Doações | Igreja/Religioso | ONGs | Crowdfunding
+- Outros > Despesas diversas | Não categorizado
 MAPA DE CATEGORIAS (RECEITAS):
 - Entradas > Salário | Rendimentos | Aluguel | Reembolso | Vendas | Cashback | Outros
 
