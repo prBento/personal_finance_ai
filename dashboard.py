@@ -215,8 +215,6 @@ def main():
         st.markdown("---")
         
         # 2. Location Filter (Blacklist UX Approach)
-        # Instead of pre-selecting everything (which causes a massive wall of tags in Streamlit),
-        # we start empty. The user only selects locations they want to EXCLUDE from the analysis.
         locais_disp = sorted(df_inst["location_name"].dropna().unique().tolist())
         locais_excluidos = st.multiselect(
             "🏢 Ocultar locais específicos:", 
@@ -327,9 +325,16 @@ def main():
                 df_cat = (df_desp.groupby("macro_category")["real_amount"]
                           .sum().reset_index()
                           .sort_values("real_amount", ascending=False))
+                
+                df_cat["lbl"] = df_cat["real_amount"].apply(fmt_brl)
+                
                 fig = px.bar(df_cat, x="real_amount", y="macro_category", orientation="h",
                              color="real_amount", color_continuous_scale="Reds",
-                             labels={"real_amount": "R$", "macro_category": ""})
+                             labels={"real_amount": "R$", "macro_category": ""},
+                             text="lbl")
+                
+                fig.update_traces(textposition="outside", cliponaxis=False) # FIX: cliponaxis here
+                fig.update_xaxes(showticklabels=False, title="")
                 fig.update_layout(showlegend=False, coloraxis_showscale=False,
                                   margin=dict(l=0, r=0, t=10, b=0), height=300)
                 st.plotly_chart(fig, use_container_width=True)
@@ -344,7 +349,11 @@ def main():
                 fig2 = px.pie(df_status, values="Valor", names="Status",
                               hole=0.55, color="Status",
                               color_discrete_map={"Pago": "#1D9E75", "Pendente": "#E24B4A"})
-                fig2.update_traces(textinfo="percent+label")
+                
+                fig2.update_traces(
+                    textinfo="percent+label+value", 
+                    texttemplate="%{label}:<br>R$ %{value:,.2f}<br>(%{percent})"
+                )
                 fig2.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=300)
                 st.plotly_chart(fig2, use_container_width=True)
 
@@ -357,11 +366,18 @@ def main():
                 df_top = (df_desp.groupby("location_name")["real_amount"]
                           .sum().reset_index()
                           .sort_values("real_amount", ascending=False).head(10))
+                
+                df_top["lbl"] = df_top["real_amount"].apply(fmt_brl)
+                
                 fig3 = px.bar(df_top, x="location_name", y="real_amount",
                               labels={"real_amount": "R$", "location_name": ""},
-                              color="real_amount", color_continuous_scale="Blues")
+                              color="real_amount", color_continuous_scale="Blues",
+                              text="lbl")
+                
+                fig3.update_traces(textposition="outside", cliponaxis=False) # FIX: cliponaxis here
+                fig3.update_yaxes(showticklabels=False, title="")
                 fig3.update_layout(showlegend=False, coloraxis_showscale=False,
-                                   xaxis_tickangle=-35, height=280,
+                                   xaxis_tickangle=-35, height=320,
                                    margin=dict(l=0, r=0, t=10, b=0))
                 st.plotly_chart(fig3, use_container_width=True)
 
@@ -371,9 +387,13 @@ def main():
                 df_met = (df_desp.groupby("payment_method")["real_amount"]
                           .sum().reset_index()
                           .sort_values("real_amount", ascending=False))
-                fig4 = px.pie(df_met, values="real_amount", names="payment_method",
-                              hole=0.4)
-                fig4.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=280)
+                fig4 = px.pie(df_met, values="real_amount", names="payment_method", hole=0.4)
+                
+                fig4.update_traces(
+                    textinfo="percent+label+value", 
+                    texttemplate="%{label}:<br>R$ %{value:,.2f}<br>(%{percent})"
+                )
+                fig4.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=320)
                 st.plotly_chart(fig4, use_container_width=True)
 
     # ==========================================
@@ -392,34 +412,43 @@ def main():
         trend = (df_y.groupby(["month", "month_dt", "transaction_type"])["real_amount"]
                  .sum().unstack(fill_value=0).reset_index().sort_values("month_dt"))
         
-        # Ensure columns exist even if data is missing
         if "RECEITA" not in trend.columns: trend["RECEITA"] = 0
         if "DESPESA" not in trend.columns: trend["DESPESA"] = 0
         
         trend["Saldo"] = trend["RECEITA"] - trend["DESPESA"]
-        
-        # Savings Rate Calculation (Protects against division by zero using Python's native float('nan'))
         trend["Taxa Poupança (%)"] = (trend["Saldo"] / trend["RECEITA"].replace(0, float('nan')) * 100).round(1)
+
+        trend["lbl_rec"] = trend["RECEITA"].apply(lambda x: fmt_brl(x) if x > 0 else "")
+        trend["lbl_desp"] = trend["DESPESA"].apply(lambda x: fmt_brl(x) if x > 0 else "")
+        trend["lbl_saldo"] = trend["Saldo"].apply(fmt_brl)
 
         fig_trend = go.Figure()
         fig_trend.add_trace(go.Bar(x=trend["month"], y=trend["RECEITA"], name="Receitas",
-                                   marker_color="#1D9E75"))
+                                   marker_color="#1D9E75", text=trend["lbl_rec"], textposition="auto"))
         fig_trend.add_trace(go.Bar(x=trend["month"], y=trend["DESPESA"], name="Despesas",
-                                   marker_color="#E24B4A"))
+                                   marker_color="#E24B4A", text=trend["lbl_desp"], textposition="auto"))
         fig_trend.add_trace(go.Scatter(x=trend["month"], y=trend["Saldo"], name="Saldo",
-                                       mode="lines+markers", line=dict(color="#378ADD", width=2.5)))
+                                       mode="lines+markers+text", text=trend["lbl_saldo"], textposition="top center", 
+                                       line=dict(color="#378ADD", width=2.5)))
+        
+        fig_trend.update_traces(cliponaxis=False) # FIX: cliponaxis here
+        fig_trend.update_yaxes(showticklabels=False, title="")
         fig_trend.update_layout(barmode="group", hovermode="x unified",
-                                xaxis_title="", yaxis_title="R$",
-                                margin=dict(t=10, b=0), height=320)
+                                xaxis_title="", yaxis_title="",
+                                margin=dict(t=10, b=0), height=360)
         st.plotly_chart(fig_trend, use_container_width=True)
 
         # Savings Rate Evolution
         st.markdown("### Taxa de Poupança — evolução mensal")
+        trend["lbl_poup"] = trend["Taxa Poupança (%)"].apply(lambda x: f"{x:.1f}%" if pd.notna(x) else "")
         fig_poup = px.line(trend, x="month", y="Taxa Poupança (%)", markers=True,
-                           color_discrete_sequence=["#534AB7"])
+                           color_discrete_sequence=["#534AB7"], text="lbl_poup")
+        
+        fig_poup.update_traces(textposition="top center", cliponaxis=False) # FIX: cliponaxis here
+        fig_poup.update_yaxes(showticklabels=False, title="")
         fig_poup.add_hline(y=20, line_dash="dash", line_color="#E24B4A",
                            annotation_text="Meta mínima 20%", annotation_position="top right")
-        fig_poup.update_layout(height=220, margin=dict(t=10, b=0))
+        fig_poup.update_layout(height=260, margin=dict(t=10, b=0))
         st.plotly_chart(fig_poup, use_container_width=True)
 
         st.markdown("---")
@@ -434,10 +463,17 @@ def main():
                 df_cat_trend = (df_y_desp[df_y_desp["macro_category"].isin(cats_sel)]
                                 .groupby(["month", "month_dt", "macro_category"])["real_amount"]
                                 .sum().reset_index().sort_values("month_dt"))
+                
+                df_cat_trend["lbl"] = df_cat_trend["real_amount"].apply(fmt_brl)
+                
                 fig_cat = px.line(df_cat_trend, x="month", y="real_amount",
                                   color="macro_category", markers=True,
-                                  labels={"real_amount": "R$", "macro_category": "Categoria", "month": ""})
-                fig_cat.update_layout(height=300, margin=dict(t=10, b=0))
+                                  labels={"real_amount": "R$", "macro_category": "Categoria", "month": ""},
+                                  text="lbl")
+                
+                fig_cat.update_traces(textposition="top center", cliponaxis=False) # FIX: cliponaxis here
+                fig_cat.update_yaxes(showticklabels=False, title="")
+                fig_cat.update_layout(height=320, margin=dict(t=10, b=0))
                 st.plotly_chart(fig_cat, use_container_width=True)
 
         st.markdown("---")
@@ -455,6 +491,7 @@ def main():
             with col_c1:
                 fig_card = px.pie(df_c, values="real_amount", names="cartao",
                                   hole=0.45, color_discrete_sequence=px.colors.qualitative.Pastel)
+                fig_card.update_traces(textinfo="percent+label")
                 fig_card.update_layout(height=280, margin=dict(t=10, b=0))
                 st.plotly_chart(fig_card, use_container_width=True)
             with col_c2:
@@ -473,14 +510,21 @@ def main():
         df_disc["Acumulado"] = df_disc["discount_applied"].cumsum()
         
         if df_disc["discount_applied"].sum() > 0:
+            df_disc["lbl_disc"] = df_disc["discount_applied"].apply(lambda x: fmt_brl(x) if x > 0 else "")
+            df_disc["lbl_acum"] = df_disc["Acumulado"].apply(lambda x: fmt_brl(x) if x > 0 else "")
+            
             fig_disc = go.Figure()
             fig_disc.add_trace(go.Bar(x=df_disc["month"], y=df_disc["discount_applied"],
-                                      name="Desconto no mês", marker_color="#1D9E75"))
+                                      name="Desconto no mês", marker_color="#1D9E75", 
+                                      text=df_disc["lbl_disc"], textposition="auto"))
             fig_disc.add_trace(go.Scatter(x=df_disc["month"], y=df_disc["Acumulado"],
-                                          name="Acumulado", mode="lines+markers",
-                                          line=dict(color="#534AB7", width=2)))
-            fig_disc.update_layout(hovermode="x unified", height=250,
-                                   margin=dict(t=10, b=0))
+                                          name="Acumulado", mode="lines+markers+text",
+                                          line=dict(color="#534AB7", width=2),
+                                          text=df_disc["lbl_acum"], textposition="top center"))
+            
+            fig_disc.update_traces(cliponaxis=False) # FIX: cliponaxis here
+            fig_disc.update_yaxes(showticklabels=False, title="")
+            fig_disc.update_layout(hovermode="x unified", height=280, margin=dict(t=10, b=0))
             st.plotly_chart(fig_disc, use_container_width=True)
         else:
             st.info("Nenhum desconto registrado no ano selecionado.")
@@ -518,7 +562,6 @@ def main():
             st.markdown(f"**{cor} {idx_comp:.1f}%** da renda dos próximos {meses_horizonte} meses já está comprometida")
             st.caption(f"Total comprometido: {fmt_brl(comprometido)} | Renda de referência ({meses_horizonte}x {mes_sel}): {fmt_brl(rec_mes_ref * meses_horizonte)}")
             
-            # Visual Gauge logic
             fig_gauge = go.Figure(go.Indicator(
                 mode="gauge+number", value=round(idx_comp, 1),
                 number={"suffix": "%"},
@@ -545,14 +588,22 @@ def main():
                     .sum().reset_index().sort_values("month_dt"))
         if not df_curva.empty:
             df_curva["Acumulado"] = df_curva["expected_amount"].cumsum()
+            df_curva["lbl_val"] = df_curva["expected_amount"].apply(fmt_brl)
+            df_curva["lbl_acum"] = df_curva["Acumulado"].apply(fmt_brl)
+            
             fig_curva = go.Figure()
             fig_curva.add_trace(go.Bar(x=df_curva["month"], y=df_curva["expected_amount"],
-                                       name="Vencimento no mês", marker_color="#E24B4A"))
+                                       name="Vencimento no mês", marker_color="#E24B4A",
+                                       text=df_curva["lbl_val"], textposition="auto"))
             fig_curva.add_trace(go.Scatter(x=df_curva["month"], y=df_curva["Acumulado"],
-                                           name="Acumulado", mode="lines+markers",
-                                           line=dict(color="#533AB7", width=2)))
+                                           name="Acumulado", mode="lines+markers+text",
+                                           line=dict(color="#533AB7", width=2),
+                                           text=df_curva["lbl_acum"], textposition="top center"))
+            
+            fig_curva.update_traces(cliponaxis=False) # FIX: cliponaxis here
+            fig_curva.update_yaxes(showticklabels=False, title="")
             fig_curva.update_layout(barmode="group", hovermode="x unified",
-                                    height=280, margin=dict(t=10, b=0))
+                                    height=300, margin=dict(t=10, b=0))
             st.plotly_chart(fig_curva, use_container_width=True)
 
         st.markdown("---")
@@ -575,7 +626,6 @@ def main():
                         ).reset_index()
                         .sort_values("total_restante", ascending=False))
 
-            # Streamlit Accordions for tactical drill-downs
             for _, row in agrupado.iterrows():
                 with st.expander(
                     f"🏢 {row['location_name']} — {fmt_brl(row['total_restante'])} "
@@ -615,19 +665,31 @@ def main():
             trend_fut["Saldo"] = trend_fut["RECEITA"] - trend_fut["DESPESA"]
             trend_fut["Saldo Acumulado"] = trend_fut["Saldo"].cumsum()
 
+            trend_fut["lbl_rec"] = trend_fut["RECEITA"].apply(lambda x: fmt_brl(x) if x > 0 else "")
+            trend_fut["lbl_desp"] = trend_fut["DESPESA"].apply(lambda x: fmt_brl(x) if x > 0 else "")
+            trend_fut["lbl_saldo"] = trend_fut["Saldo"].apply(fmt_brl)
+            trend_fut["lbl_acum"] = trend_fut["Saldo Acumulado"].apply(fmt_brl)
+
             fig_fut = go.Figure()
             fig_fut.add_trace(go.Bar(x=trend_fut["month"], y=trend_fut["RECEITA"],
-                                     name="Receitas previstas", marker_color="#1D9E75"))
+                                     name="Receitas previstas", marker_color="#1D9E75",
+                                     text=trend_fut["lbl_rec"], textposition="auto"))
             fig_fut.add_trace(go.Bar(x=trend_fut["month"], y=trend_fut["DESPESA"],
-                                     name="Despesas comprometidas", marker_color="#E24B4A"))
+                                     name="Despesas comprometidas", marker_color="#E24B4A",
+                                     text=trend_fut["lbl_desp"], textposition="auto"))
             fig_fut.add_trace(go.Scatter(x=trend_fut["month"], y=trend_fut["Saldo"],
-                                         name="Saldo do mês", mode="lines+markers",
-                                         line=dict(color="#378ADD", width=2.5)))
+                                         name="Saldo do mês", mode="lines+markers+text",
+                                         line=dict(color="#378ADD", width=2.5),
+                                         text=trend_fut["lbl_saldo"], textposition="top center"))
             fig_fut.add_trace(go.Scatter(x=trend_fut["month"], y=trend_fut["Saldo Acumulado"],
-                                         name="Saldo acumulado", mode="lines",
-                                         line=dict(color="#534AB7", width=1.5, dash="dot")))
+                                         name="Saldo acumulado", mode="lines+markers+text",
+                                         line=dict(color="#534AB7", width=1.5, dash="dot"),
+                                         text=trend_fut["lbl_acum"], textposition="bottom center"))
+            
+            fig_fut.update_traces(cliponaxis=False) # FIX: cliponaxis here
+            fig_fut.update_yaxes(showticklabels=False, title="")
             fig_fut.update_layout(barmode="group", hovermode="x unified",
-                                  height=360, margin=dict(t=10, b=0))
+                                  height=400, margin=dict(t=10, b=0))
             st.plotly_chart(fig_fut, use_container_width=True)
 
             st.markdown("### Detalhamento mensal")
@@ -658,7 +720,6 @@ def main():
             qtd_notas   = df_op["transaction_id"].nunique()
             ticket_medio = total_itens / qtd_notas if qtd_notas > 0 else 0
 
-            # Operational KPIs
             k1, k2, k3, k4 = st.columns(4)
             k1.metric("Total em Itens (NF-e)", fmt_brl(total_itens))
             k2.metric("Notas Fiscais c/ Itens", qtd_notas)
@@ -680,6 +741,7 @@ def main():
                     color_continuous_scale="Reds",
                     hover_data={"item_total": ":,.2f"},
                 )
+                fig_tree.update_traces(textinfo="label+value")
                 fig_tree.update_layout(margin=dict(t=10, l=0, r=0, b=0), height=380)
                 st.plotly_chart(fig_tree, use_container_width=True)
 
@@ -735,12 +797,19 @@ def main():
                     df_top_brand = (df_brand.groupby("brand")["item_total"]
                                     .sum().reset_index()
                                     .sort_values("item_total", ascending=False).head(10))
+                    
+                    df_top_brand["lbl"] = df_top_brand["item_total"].apply(fmt_brl)
+                    
                     fig_brand = px.bar(df_top_brand, x="item_total", y="brand",
                                        orientation="h", color="item_total",
                                        color_continuous_scale="Purples",
-                                       labels={"item_total": "R$", "brand": ""})
+                                       labels={"item_total": "R$", "brand": ""},
+                                       text="lbl")
+                    
+                    fig_brand.update_traces(textposition="outside", cliponaxis=False) # FIX: cliponaxis here
+                    fig_brand.update_xaxes(showticklabels=False, title="") 
                     fig_brand.update_layout(showlegend=False, coloraxis_showscale=False,
-                                            height=320, margin=dict(t=10, b=0))
+                                            height=340, margin=dict(t=10, b=0))
                     st.plotly_chart(fig_brand, use_container_width=True)
                 else:
                     st.info("Nenhuma marca registrada nos itens.")
@@ -789,9 +858,10 @@ def main():
                     pivot,
                     color_continuous_scale="YlOrRd",
                     aspect="auto",
+                    text_auto=".0f",
                     labels={"x": "Dia do mês", "y": "Categoria", "color": "R$"},
                 )
-                fig_heat.update_layout(height=280, margin=dict(t=10, b=0))
+                fig_heat.update_layout(height=320, margin=dict(t=10, b=0))
                 st.plotly_chart(fig_heat, use_container_width=True)
 
             st.markdown("---")
@@ -847,19 +917,19 @@ def main():
             "Valores refletem o que foi efetivamente pago ou o previsto atualizado."
         )
         
-        # Filtro inicial pelo ano de competência (Vencimento)
+        # Initial filter by accrual year (Due Date)
         df_matriz = df_inst[df_inst["real_year"] == ano_sel].copy()
         
         if df_matriz.empty:
             st.info(f"Nenhum dado com vencimento em {ano_sel} encontrado.")
         else:
-            # Preparação de colunas auxiliares
+            # Auxiliary columns preparation
             df_matriz["Cartão"] = df_matriz.apply(
                 lambda r: f"{r['card_bank']} {r['card_variant']}".strip() if r['card_bank'] else "À Vista / Pix",
                 axis=1
             )
 
-            # --- FILTROS LOCAIS DA ABA ---
+            # --- LOCAL TAB FILTERS ---
             st.markdown("##### 🔍 Filtros de Auditoria")
             f1, f2, f3 = st.columns(3)
             
@@ -875,12 +945,12 @@ def main():
                 categorias_f = sorted(df_matriz["macro_category"].unique().tolist())
                 sel_cats = st.multiselect("Filtrar por Categoria:", categorias_f, placeholder="Todas as categorias")
 
-            # Aplicação dos filtros dinâmicos
+            # Apply dynamic filters
             if sel_locais: df_matriz = df_matriz[df_matriz["location_name"].isin(sel_locais)]
             if sel_cartoes: df_matriz = df_matriz[df_matriz["Cartão"].isin(sel_cartoes)]
             if sel_cats: df_matriz = df_matriz[df_matriz["macro_category"].isin(sel_cats)]
 
-            # Ordenação cronológica das colunas de meses
+            # Chronological sorting of month columns
             meses_colunas = sorted(
                 df_matriz["real_month"].unique().tolist(), 
                 key=lambda x: datetime.strptime(str(x), "%m/%Y")
@@ -894,7 +964,7 @@ def main():
                     st.write(f"_Nenhum registro de {label.lower()} encontrado com os filtros aplicados._")
                     continue
 
-                # PIVOT TABLE: Apenas macro_category, garantindo que o valor nunca seja multiplicado
+                # PIVOT TABLE: Only macro_category, ensuring values are never multiplied
                 pivot = pd.pivot_table(
                     df_tipo,
                     values='real_amount',
@@ -904,18 +974,18 @@ def main():
                     fill_value=0
                 )
 
-                # Proteção anti-crash caso os filtros esvaziem a visualização
+                # Anti-crash protection in case filters empty the view
                 if pivot.empty:
                     st.write(f"_Nenhum dado válido para exibir nesta seção._")
                     continue
 
-                # Força todas as colunas de meses a aparecerem, preenchendo com 0 onde não há dados
+                # Forces all month columns to appear, filling with 0 where there is no data
                 pivot = pivot.reindex(columns=meses_colunas, fill_value=0)
                 
-                # Calcula o total anual da linha
+                # Calculates the annual row total
                 pivot['Total Ano'] = pivot.sum(axis=1)
                 
-                # Tira o index agrupado para formatar como dataframe comum
+                # Removes the grouped index to format as a standard dataframe
                 pivot = pivot.reset_index()
                 
                 pivot.rename(columns={
@@ -926,7 +996,7 @@ def main():
 
                 pivot = pivot.sort_values(by=['Categoria', 'Estabelecimento / Origem'])
 
-                # Formatação Monetária Interativa
+                # Interactive Monetary Formatting
                 for col in meses_colunas + ['Total Ano']:
                     pivot[col] = pivot[col].apply(
                         lambda x: f"R$ {x:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.') if x != 0 else "-"
