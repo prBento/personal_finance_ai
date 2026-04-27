@@ -1,3 +1,4 @@
+import calendar
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -248,18 +249,31 @@ def main():
             lambda b: any(k in b for k in BEN_BANKS))]
 
     # Create a specific dataframe for single-month views
-    df_mes = df_inst[df_inst["month"] == mes_sel].copy()
+    df_inst_liq = df_inst[~df_inst["is_benefit"]]
+
+    # Slices mensais — liq para KPIs/gráficos, completo para o bloco de benefício
+    df_mes     = df_inst[df_inst["month"] == mes_sel].copy()
+    df_mes_liq = df_inst_liq[df_inst_liq["month"] == mes_sel].copy()
+
+    _mes_sel_dt = pd.to_datetime(mes_sel, format="%m/%Y")
+
+    _hist = df_inst_liq[df_inst_liq["month_dt"] < _mes_sel_dt]
+    saldo_atual_carryover = (
+        _hist[_hist["transaction_type"] == "RECEITA"]["real_amount"].sum()
+        - _hist[_hist["transaction_type"] == "DESPESA"]["real_amount"].sum()
+    )
 
     # ==========================================
     # --- Tabs Configuration ---
     # ==========================================
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
         "🎯  Saúde do Mês",
         "📈  Tendências",
         "💳  Cartões & Parcelas",
         "🔭  Projeção de Caixa",
         "🛒  Operacional — Itens",
         "🧮  Matriz de Conferência",
+        "🏧  Extrato de Cartões",
     ])
 
     # ==========================================
@@ -268,8 +282,8 @@ def main():
     with tab1:
         st.subheader(f"Resumo Executivo — {mes_sel}")
 
-        df_rec  = df_mes[df_mes["transaction_type"] == "RECEITA"]
-        df_desp = df_mes[df_mes["transaction_type"] == "DESPESA"]
+        df_rec  = df_mes_liq[df_mes_liq["transaction_type"] == "RECEITA"]
+        df_desp = df_mes_liq[df_mes_liq["transaction_type"] == "DESPESA"]
 
         # Accurate aggregation separating Realized (Cash in hand) vs Pending (Future commitments)
         rec_realizada  = df_rec[df_rec["payment_status"] == "PAID"]["paid_amount"].sum()
@@ -403,7 +417,7 @@ def main():
         st.subheader(f"Tendências — {ano_sel}")
 
         # Slice data for the entire selected year
-        df_y = df_inst[df_inst["year"] == ano_sel].copy()
+        df_y = df_inst_liq[df_inst_liq["year"] == ano_sel].copy()
         df_y_desp = df_y[df_y["transaction_type"] == "DESPESA"]
         df_y_rec  = df_y[df_y["transaction_type"] == "RECEITA"]
 
@@ -481,7 +495,18 @@ def main():
         # --- Credit Card Reliance ---
         st.markdown("### Participação por Cartão no Total Gasto")
         if not df_y_desp.empty:
-            df_cards = df_y_desp.copy()
+            escopo_cartao = st.radio(
+                "Escopo", ["Mês selecionado", "Ano todo"],
+                horizontal=True, key="escopo_cartao"
+            )
+            df_cards_src = (
+                df_mes_liq[df_mes_liq["transaction_type"] == "DESPESA"].copy()
+                if escopo_cartao == "Mês selecionado"
+                else df_y_desp.copy()
+            )
+            titulo_cartao = f"Mês: {mes_sel}" if escopo_cartao == "Mês selecionado" else f"Ano: {ano_sel}"
+
+            df_cards = df_cards_src.copy()
             df_cards["cartao"] = (df_cards["card_bank"].str.strip() + " " +
                                   df_cards["card_variant"].str.strip()).str.strip()
             df_cards["cartao"] = df_cards["cartao"].replace("", "Sem cartão / À vista")
@@ -490,21 +515,22 @@ def main():
             col_c1, col_c2 = st.columns([1, 1])
             with col_c1:
                 fig_card = px.pie(df_c, values="real_amount", names="cartao",
-                                  hole=0.45, color_discrete_sequence=px.colors.qualitative.Pastel)
+                                  hole=0.45, color_discrete_sequence=px.colors.qualitative.Pastel,
+                                  title=titulo_cartao)
                 fig_card.update_traces(textinfo="percent+label")
-                fig_card.update_layout(height=280, margin=dict(t=10, b=0))
+                fig_card.update_layout(height=280, margin=dict(t=30, b=0))
                 st.plotly_chart(fig_card, use_container_width=True)
             with col_c2:
                 df_c["Participação (%)"] = (df_c["real_amount"] / df_c["real_amount"].sum() * 100).round(1)
                 df_c.columns = ["Cartão", "Total (R$)", "Participação (%)"]
-                df_c["Total (R$)"] = df_c["Total (R$)"].apply(lambda v: f"{v:,.2f}")
+                df_c["Total (R$)"] = df_c["Total (R$)"].apply(lambda v: fmt_brl(v))
                 st.dataframe(df_c, use_container_width=True, hide_index=True)
 
         st.markdown("---")
 
         # --- Cumulative Savings (Gamification metric) ---
         st.markdown("### Economia Acumulada — Descontos & Antecipações")
-        df_disc = (df_inst[df_inst["year"] == ano_sel]
+        df_disc = (df_inst_liq[df_inst_liq["year"] == ano_sel]
                    .groupby(["month", "month_dt"])["discount_applied"]
                    .sum().reset_index().sort_values("month_dt"))
         df_disc["Acumulado"] = df_disc["discount_applied"].cumsum()
@@ -536,7 +562,7 @@ def main():
         st.subheader("Gestão de Cartões e Parcelamentos")
 
         # Focuses entirely on unpaid, pending commitments
-        df_pend = df_inst[df_inst["payment_status"] == "PENDING"].copy()
+        df_pend = df_inst_liq[df_inst_liq["payment_status"] == "PENDING"].copy()
 
         # --- Income Commitment Gauge ---
         st.markdown("### Índice de Comprometimento de Renda")
@@ -553,8 +579,8 @@ def main():
         comprometido = df_comp["expected_amount"].sum()
 
         # Assumes the selected month's income is the baseline for the future
-        rec_mes_ref = (df_inst[(df_inst["month"] == mes_sel) &
-                               (df_inst["transaction_type"] == "RECEITA")]["real_amount"].sum())
+        rec_mes_ref = (df_inst_liq[(df_inst_liq["month"] == mes_sel) &
+                               (df_inst_liq["transaction_type"] == "RECEITA")]["real_amount"].sum())
 
         if rec_mes_ref > 0:
             idx_comp = comprometido / (rec_mes_ref * meses_horizonte) * 100
@@ -650,53 +676,76 @@ def main():
     # ==========================================
     with tab4:
         st.subheader("Projeção de Caixa — Burn Rate")
+        st.caption(
+            f"Partindo do saldo realizado de **{mes_sel}** ({fmt_brl(saldo_atual_carryover)}) "
+            "como ponto inicial. Valores futuros usam `expected_amount` (regime de competência)."
+        )
 
-        # Filters from the selected month ONWARD to plot the future
-        df_fut = df_inst[df_inst["month_dt"] >= pd.to_datetime(mes_sel, format="%m/%Y")].copy()
+        df_fut = df_inst_liq[df_inst_liq["month_dt"] >= pd.to_datetime(mes_sel, format="%m/%Y")].copy()
 
         if df_fut.empty:
             st.info("Nenhuma projeção disponível.")
         else:
-            trend_fut = (df_fut.groupby(["month", "month_dt", "transaction_type"])["expected_amount"]
+            trend_fut = (df_fut.groupby(["month", "month_dt", "transaction_type"])["real_amount"]
                          .sum().unstack(fill_value=0).reset_index().sort_values("month_dt"))
             if "RECEITA" not in trend_fut.columns: trend_fut["RECEITA"] = 0
             if "DESPESA" not in trend_fut.columns: trend_fut["DESPESA"] = 0
-            
-            trend_fut["Saldo"] = trend_fut["RECEITA"] - trend_fut["DESPESA"]
-            trend_fut["Saldo Acumulado"] = trend_fut["Saldo"].cumsum()
 
-            trend_fut["lbl_rec"] = trend_fut["RECEITA"].apply(lambda x: fmt_brl(x) if x > 0 else "")
-            trend_fut["lbl_desp"] = trend_fut["DESPESA"].apply(lambda x: fmt_brl(x) if x > 0 else "")
+            trend_fut["Saldo"] = trend_fut["RECEITA"] - trend_fut["DESPESA"]
+            
+            # O saldo começa com o que sobrou dos meses anteriores (carryover) e soma progressivamente
+            saldo_acum = []
+            acumulado_atual = saldo_atual_carryover
+            
+            for i in range(len(trend_fut)):
+                acumulado_atual += trend_fut["Saldo"].iloc[i]
+                saldo_acum.append(acumulado_atual)
+                
+            trend_fut["Saldo Acumulado"] = saldo_acum
+
+            # Labels apenas nas linhas de saldo — barras ficam sem texto (hover é suficiente)
             trend_fut["lbl_saldo"] = trend_fut["Saldo"].apply(fmt_brl)
-            trend_fut["lbl_acum"] = trend_fut["Saldo Acumulado"].apply(fmt_brl)
+            trend_fut["lbl_acum"]  = trend_fut["Saldo Acumulado"].apply(fmt_brl)
 
             fig_fut = go.Figure()
-            fig_fut.add_trace(go.Bar(x=trend_fut["month"], y=trend_fut["RECEITA"],
-                                     name="Receitas previstas", marker_color="#1D9E75",
-                                     text=trend_fut["lbl_rec"], textposition="auto"))
-            fig_fut.add_trace(go.Bar(x=trend_fut["month"], y=trend_fut["DESPESA"],
-                                     name="Despesas comprometidas", marker_color="#E24B4A",
-                                     text=trend_fut["lbl_desp"], textposition="auto"))
-            fig_fut.add_trace(go.Scatter(x=trend_fut["month"], y=trend_fut["Saldo"],
-                                         name="Saldo do mês", mode="lines+markers+text",
-                                         line=dict(color="#378ADD", width=2.5),
-                                         text=trend_fut["lbl_saldo"], textposition="top center"))
-            fig_fut.add_trace(go.Scatter(x=trend_fut["month"], y=trend_fut["Saldo Acumulado"],
-                                         name="Saldo acumulado", mode="lines+markers+text",
-                                         line=dict(color="#534AB7", width=1.5, dash="dot"),
-                                         text=trend_fut["lbl_acum"], textposition="bottom center"))
-            
-            fig_fut.update_traces(cliponaxis=False) # FIX: cliponaxis here
+            fig_fut.add_trace(go.Bar(
+                x=trend_fut["month"], y=trend_fut["RECEITA"],
+                name="Receitas previstas", marker_color="#1D9E75",
+                hovertemplate="<b>%{x}</b><br>Receita: R$ %{y:,.2f}<extra></extra>"
+            ))
+            fig_fut.add_trace(go.Bar(
+                x=trend_fut["month"], y=trend_fut["DESPESA"],
+                name="Despesas comprometidas", marker_color="#E24B4A",
+                hovertemplate="<b>%{x}</b><br>Despesa: R$ %{y:,.2f}<extra></extra>"
+            ))
+            fig_fut.add_trace(go.Scatter(
+                x=trend_fut["month"], y=trend_fut["Saldo"],
+                name="Saldo do mês", mode="lines+markers+text",
+                line=dict(color="#378ADD", width=2.5),
+                text=trend_fut["lbl_saldo"], textposition="top center",
+                hovertemplate="<b>%{x}</b><br>Saldo: R$ %{y:,.2f}<extra></extra>"
+            ))
+            fig_fut.add_trace(go.Scatter(
+                x=trend_fut["month"], y=trend_fut["Saldo Acumulado"],
+                name=f"Acumulado (desde {mes_sel})", mode="lines+markers+text",
+                line=dict(color="#534AB7", width=1.5, dash="dot"),
+                text=trend_fut["lbl_acum"], textposition="bottom center",
+                hovertemplate="<b>%{x}</b><br>Acumulado: R$ %{y:,.2f}<extra></extra>"
+            ))
+
+            fig_fut.update_traces(cliponaxis=False)
             fig_fut.update_yaxes(showticklabels=False, title="")
-            fig_fut.update_layout(barmode="group", hovermode="x unified",
-                                  height=400, margin=dict(t=10, b=0))
+            fig_fut.update_layout(
+                barmode="group", hovermode="x unified",
+                height=400, margin=dict(t=30, b=0)
+            )
             st.plotly_chart(fig_fut, use_container_width=True)
 
             st.markdown("### Detalhamento mensal")
             df_resumo = trend_fut[["month", "RECEITA", "DESPESA", "Saldo", "Saldo Acumulado"]].copy()
             df_resumo.columns = ["Mês", "Receitas (R$)", "Despesas (R$)", "Saldo (R$)", "Saldo Acumulado (R$)"]
             for col in ["Receitas (R$)", "Despesas (R$)", "Saldo (R$)", "Saldo Acumulado (R$)"]:
-                df_resumo[col] = df_resumo[col].apply(lambda v: f"{v:,.2f}")
+                df_resumo[col] = df_resumo[col].apply(lambda v: fmt_brl(v))
             st.dataframe(df_resumo, use_container_width=True, hide_index=True)
 
     # ==========================================
@@ -845,28 +894,147 @@ def main():
 
             st.markdown("---")
 
-            # --- Block 5: Temporal Heatmap ---
+            # --- Block 5: Temporal Heatmap — todos os dias do mês ---
             st.markdown("### Padrão de Gastos por Dia do Mês")
-            st.caption("Concentração de gastos ao longo do mês por categoria.")
-            
+            st.caption("Todos os dias exibidos — dias sem gasto aparecem em branco.")
+
             df_op["dia"] = df_op["transaction_date"].dt.day
-            df_heat = (df_op.groupby(["dia", "cat_macro"])["item_total"]
-                       .sum().reset_index())
+
+            # Gera todos os dias válidos do mês selecionado
+            mes_num, ano_num = int(mes_sel[:2]), int(mes_sel[3:])
+            _, total_dias = calendar.monthrange(ano_num, mes_num)
+            todos_dias = list(range(1, total_dias + 1))
+
+            df_heat = (df_op.groupby(["dia", "cat_macro"])["item_total"].sum().reset_index())
             if not df_heat.empty:
                 pivot = df_heat.pivot(index="cat_macro", columns="dia", values="item_total").fillna(0)
+                # Preenche dias sem dados com 0 para exibir o mês completo
+                pivot = pivot.reindex(columns=todos_dias, fill_value=0)
+
+                # --- O TRUQUE MÁGICO AQUI ---
+                # Substitui os valores 0 por "Not a Number" (nulo). 
+                # Assim o Plotly não pinta a célula e não escreve o zero.
+                pivot = pivot.replace(0, float('nan'))
+
                 fig_heat = px.imshow(
                     pivot,
                     color_continuous_scale="YlOrRd",
                     aspect="auto",
-                    text_auto=".0f",
+                    text_auto=".0f", # <-- Volta ao padrão de string do Plotly
                     labels={"x": "Dia do mês", "y": "Categoria", "color": "R$"},
                 )
-                fig_heat.update_layout(height=320, margin=dict(t=10, b=0))
+                fig_heat.update_traces(
+                    hovertemplate="Dia %{x}<br>%{y}<br>R$ %{z:,.2f}<extra></extra>"
+                )
+                fig_heat.update_layout(height=max(280, len(pivot) * 40), margin=dict(t=10, b=0))
                 st.plotly_chart(fig_heat, use_container_width=True)
 
             st.markdown("---")
 
-            # --- Block 6: Full Data Table ---
+            # --- Block 6: Evolução Temporal de Item / Marca ---
+            st.markdown("### Evolução Temporal — Item ou Marca")
+            st.caption("Acompanhe a variação de preço ao longo do tempo e identifique o dia mais barato.")
+
+            # Escopo: mês filtrado ou ano todo
+            col_esc, col_tipo, col_pick = st.columns([1, 1, 2])
+            with col_esc:
+                escopo_item = st.radio("Período", ["Mês selecionado", "Ano todo"], key="escopo_item")
+            with col_tipo:
+                tipo_busca = st.radio("Analisar por", ["Item", "Marca"], key="tipo_item")
+
+            # Seleciona o dataset conforme escopo
+            if escopo_item == "Mês selecionado":
+                df_evo_src = df_items[df_items["month_compra"] == mes_sel].copy()
+            else:
+                df_evo_src = df_items[df_items["month_dt"].dt.year == int(ano_sel)].copy()
+
+            col_field = "item_name" if tipo_busca == "Item" else "brand"
+            opcoes_evo = sorted(df_evo_src[col_field].dropna().unique().tolist())
+            opcoes_evo = [o for o in opcoes_evo if o.strip()]
+
+            with col_pick:
+                if opcoes_evo:
+                    item_sel_evo = st.selectbox(
+                        f"Selecione o {tipo_busca.lower()}", opcoes_evo, key="item_evo_pick"
+                    )
+                else:
+                    st.info("Nenhum dado disponível para o período selecionado.")
+                    item_sel_evo = None
+
+            if item_sel_evo:
+                df_evo = df_evo_src[df_evo_src[col_field] == item_sel_evo].copy()
+                df_evo = df_evo.sort_values("transaction_date")
+                df_evo["dia_semana"] = df_evo["transaction_date"].dt.day_name()
+                df_evo["dia_semana_pt"] = df_evo["transaction_date"].dt.weekday.map({
+                    0: "Seg", 1: "Ter", 2: "Qua", 3: "Qui", 4: "Sex", 5: "Sáb", 6: "Dom"
+                })
+                df_evo["data_str"] = df_evo["transaction_date"].dt.strftime("%d/%m/%Y")
+
+                col_ev1, col_ev2 = st.columns([2, 1])
+
+                with col_ev1:
+                    # Linha de evolução de preço unitário
+                    fig_evo = px.line(
+                        df_evo, x="transaction_date", y="unit_price",
+                        markers=True,
+                        color="location_name",
+                        labels={"unit_price": "Preço unit. (R$)", "transaction_date": "", "location_name": "Local"},
+                        title=f"Evolução de preço — {item_sel_evo}",
+                        hover_data={"data_str": True, "unit_price": ":,.2f", "location_name": True}
+                    )
+                    # Marca o ponto mínimo e máximo
+                    if not df_evo.empty:
+                        idx_min = df_evo["unit_price"].idxmin()
+                        idx_max = df_evo["unit_price"].idxmax()
+                        for idx, cor, label in [(idx_min, "#1D9E75", "Mín"), (idx_max, "#E24B4A", "Máx")]:
+                            fig_evo.add_annotation(
+                                x=df_evo.loc[idx, "transaction_date"],
+                                y=df_evo.loc[idx, "unit_price"],
+                                text=f"{label}: {fmt_brl(df_evo.loc[idx, 'unit_price'])}",
+                                showarrow=True, arrowhead=2,
+                                font=dict(color=cor, size=11),
+                                bgcolor="white", bordercolor=cor
+                            )
+                    fig_evo.update_layout(height=300, margin=dict(t=40, b=0))
+                    st.plotly_chart(fig_evo, use_container_width=True)
+
+                with col_ev2:
+                    # Bar chart: preço médio por dia da semana (ordem Seg-Dom)
+                    ordem_dias = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+                    df_dow = (df_evo.groupby("dia_semana_pt")["unit_price"]
+                              .mean().reset_index()
+                              .rename(columns={"dia_semana_pt": "Dia", "unit_price": "Preço médio"}))
+                    df_dow["Dia"] = pd.Categorical(df_dow["Dia"], categories=ordem_dias, ordered=True)
+                    df_dow = df_dow.sort_values("Dia")
+                    df_dow["lbl"] = df_dow["Preço médio"].apply(fmt_brl)
+
+                    fig_dow = px.bar(
+                        df_dow, x="Dia", y="Preço médio",
+                        text="lbl", color="Preço médio",
+                        color_continuous_scale="RdYlGn_r",
+                        title="Preço médio por dia da semana",
+                        labels={"Preço médio": "R$"}
+                    )
+                    fig_dow.update_traces(textposition="outside", cliponaxis=False)
+                    fig_dow.update_yaxes(showticklabels=False, title="")
+                    fig_dow.update_layout(
+                        showlegend=False, coloraxis_showscale=False,
+                        height=300, margin=dict(t=40, b=0)
+                    )
+                    st.plotly_chart(fig_dow, use_container_width=True)
+
+                # Tabela resumo do item
+                st.caption(f"**{len(df_evo)} compras encontradas** | "
+                           f"Mín: {fmt_brl(df_evo['unit_price'].min())} | "
+                           f"Máx: {fmt_brl(df_evo['unit_price'].max())} | "
+                           f"Média: {fmt_brl(df_evo['unit_price'].mean())}")
+                df_evo_view = df_evo[["data_str", "location_name", "unit_price", "quantity", "item_total"]].copy()
+                df_evo_view.columns = ["Data", "Local", "Preço Unit. (R$)", "Qtd", "Total (R$)"]
+                st.dataframe(df_evo_view, use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # --- Block 7: Full Data Table ---
             st.markdown("### Auditoria Completa de Itens")
             col_f1, col_f2, col_f3 = st.columns(3)
             with col_f1:
@@ -918,7 +1086,7 @@ def main():
         )
         
         # Initial filter by accrual year (Due Date)
-        df_matriz = df_inst[df_inst["real_year"] == ano_sel].copy()
+        df_matriz = df_inst_liq[df_inst_liq["real_year"] == ano_sel].copy()
         
         if df_matriz.empty:
             st.info(f"Nenhum dado com vencimento em {ano_sel} encontrado.")
@@ -1008,6 +1176,97 @@ def main():
                     hide_index=True,
                     height=500 if tx_type == "DESPESA" else 300
                 )
+
+    # ==========================================
+    # TAB 7: EXTRATO DE CARTÕES (Credit Ledger)
+    # ==========================================
+    with tab7:
+        st.subheader(f"Extrato Detalhado de Cartões — {ano_sel}")
+        st.caption("Visão focada exclusivamente em transações via Cartão de Crédito.")
+
+        # Filtramos apenas o que tem banco/cartão e é crédito
+        df_cc = df_inst[
+            (df_inst["card_bank"] != "") & 
+            (df_inst["payment_method"].str.lower().str.contains(r"cr.*dito|credito", regex=True, na=False))
+        ].copy()
+
+        if df_cc.empty:
+            st.info("Nenhuma transação de cartão de crédito encontrada.")
+        else:
+            # Normalização do nome do cartão para agrupamento
+            df_cc["Cartão"] = df_cc.apply(
+                lambda r: f"{r['card_bank']} {r['card_variant']}".strip(), axis=1
+            )
+
+            # --- PARTE 1: SÉRIE TEMPORAL DE GASTOS ---
+            st.markdown("### 📈 Evolução de Gastos por Cartão")
+            df_cc_trend = (
+                df_cc[df_cc["year"] == ano_sel]
+                .groupby(["month", "month_dt", "Cartão"])["real_amount"]
+                .sum().reset_index()
+                .sort_values("month_dt")
+            )
+
+            fig_cc_trend = px.line(
+                df_cc_trend, x="month", y="real_amount", color="Cartão",
+                markers=True, text=df_cc_trend["real_amount"].apply(lambda x: f"{x:,.0f}"),
+                labels={"real_amount": "Gasto (R$)", "month": "Mês"},
+                title=f"Uso dos Cartões em {ano_sel}"
+            )
+            fig_cc_trend.update_traces(textposition="top center", cliponaxis=False)
+            fig_cc_trend.update_yaxes(showticklabels=False, title="")
+            fig_cc_trend.update_layout(height=380, margin=dict(t=50, b=0))
+            st.plotly_chart(fig_cc_trend, use_container_width=True)
+
+            st.markdown("---")
+
+            # --- PARTE 2: EXTRATO MENSAL POR CARTÃO ---
+            st.markdown(f"### 📑 Detalhamento da Fatura — {mes_sel}")
+            
+            # Filtro por mês para o extrato de tabela
+            df_cc_mes = df_cc[df_cc["month"] == mes_sel].copy()
+            
+            if df_cc_mes.empty:
+                st.write(f"_Sem lançamentos de cartão em {mes_sel}._")
+            else:
+                cartoes_mes = sorted(df_cc_mes["Cartão"].unique().tolist())
+                sel_cc = st.selectbox("Selecione o Cartão para auditar:", cartoes_mes)
+
+                df_fat = df_cc_mes[df_cc_mes["Cartão"] == sel_cc].copy()
+                
+                # KPIs Rápidos do Cartão selecionado
+                f1, f2, f3 = st.columns(3)
+                total_fat = df_fat["real_amount"].sum()
+                pago_fat = df_fat[df_fat["payment_status"] == "PAID"]["paid_amount"].sum()
+                pend_fat = df_fat[df_fat["payment_status"] == "PENDING"]["expected_amount"].sum()
+                
+                f1.metric(f"Total Fatura {sel_cc}", fmt_brl(total_fat))
+                f2.metric("Já Pago (Caixa)", fmt_brl(pago_fat))
+                f3.metric("A Pagar (Pendente)", fmt_brl(pend_fat), delta_color="inverse")
+
+                # Tabela de Itens (Extrato)
+                df_fat_view = df_fat[[
+                    "due_date", "location_name", "macro_category", 
+                    "payment_status", "real_amount", "transaction_id"
+                ]].copy()
+                
+                df_fat_view["due_date"] = df_fat_view["due_date"].dt.strftime("%d/%m/%Y")
+                df_fat_view["Status"] = df_fat_view["payment_status"].map({"PAID": "✅ Pago", "PENDING": "🔹 Pendente"})
+                
+                df_fat_view.columns = [
+                    "Vencimento", "Estabelecimento", "Categoria", 
+                    "payment_status_raw", "Valor (R$)", "Ref. ID", "Status"
+                ]
+                
+                # Ordenação por data
+                df_fat_view = df_fat_view.sort_values("Vencimento")
+
+                st.dataframe(
+                    df_fat_view[["Vencimento", "Estabelecimento", "Categoria", "Status", "Valor (R$)", "Ref. ID"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.caption(f"Exibindo {len(df_fat_view)} lançamentos para o cartão {sel_cc} em {mes_sel}.")
 
 if __name__ == "__main__":
     main()
