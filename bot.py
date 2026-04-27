@@ -291,37 +291,39 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
                             break
                     # Bulletproof fallback: Hunt for "6x" or "5 months" directly in the original text
                     if qtd_meses <= 1:
-                        match = re.search(r'(\d+)\s*(?:x|vezes|meses)', text_to_process.lower())
-                        if match:
-                            qtd_meses = int(match.group(1))
+                        patterns = [
+                            r'(\d+)\s*(?:x|vezes)',               # "6x", "6 vezes"
+                            r'(?:por|durante|ao longo de|há)\s*(\d+)\s*mes(?:es)?',  # "por 6 meses"
+                            r'(\d+)\s*mes(?:es)?\s*(?:seguidos?|consecutivos?)?',    # "6 meses seguidos"
+                        ]
+                        for pattern in patterns:
+                            match = re.search(pattern, text_to_process.lower())
+                            if match:
+                                qtd_meses = int(match.group(1))
+                                break
 
                 tx["quantidade_parcelas"] = max(1, qtd_meses)
 
                 # Heuristic 2: Mathematical Paradox Correction
-                if qtd_meses > 1 and len(tx.get("itens", [])) == 1:
-                    it = tx["itens"][0]
-                    v_unit = float(it.get("valor_unitario", 0.0))
+                if qtd_meses > 1:
+                    for it in tx.get("itens", []):
+                        v_unit = float(it.get("valor_unitario", 0.0))
+                        if v_unit <= 0:
+                            continue
 
-                    if v_unit > 0 and val_t > 0:
                         val_dividido = round(val_t / qtd_meses, 2)
-                        
-                        # Extract numbers from the original text for the ground truth test
+
                         numeros_texto = []
                         for n in re.findall(r'\d+(?:[.,]\d+)?', text_to_process):
                             try: numeros_texto.append(float(n.replace(',', '.')))
                             except: pass
 
-                        # If the AI injected the inflated value (e.g., 15000) into BOTH Total and Unitary
                         if val_dividido in numeros_texto and val_t not in numeros_texto:
                             val_t = val_dividido
-                        # Original Case A: AI multiplied the total (Total = Unit * N)
                         elif abs(val_t - round(v_unit * qtd_meses, 2)) < 1.0:
-                            val_t = v_unit  
-                        # Original Case B: AI divided the unit (Unit = Total / N)
-                        elif abs(v_unit - val_dividido) < 1.0:
-                            pass 
+                            val_t = v_unit
+                        # Caso B: não precisa fazer nada, val_t já está correto
 
-                # Force everything to the correct monthly value
                 monthly = val_t
                 tx["valor_total"]    = monthly
                 tx["valor_original"] = monthly
@@ -357,8 +359,15 @@ async def queue_processor(context: ContextTypes.DEFAULT_TYPE):
             
             for idx, it in enumerate(tx.get("itens", []), start=1):
                 it["numero_item_nota"] = str(idx)
-                if it.get("valor_unitario", 0.0) == 0.0:
+
+                nome_item = str(it.get("item", "")).lower()
+                is_brinde = any(word in nome_item for word in ["brinde", "grátis", "gratis", "amostra", "bonificação"])
+
+                if float(it.get("valor_unitario", 0.0)) == 0.0 and not is_brinde:
                     it["valor_unitario"] = round(float(tx.get("valor_total") or 0) / max(1, float(it.get("quantidade") or 1)), 2)
+                
+                elif is_brinde:
+                    it["valor_unitario"] = 0.0
 
         complete_queue_item(item['id'])
         
@@ -460,7 +469,7 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
     is_missing_loc = str(loc_name).strip().lower() in clean_words or "desconhecido" in str(loc_name).strip().lower()
 
     if current_state != "AGUARDANDO_CONFIRMACAO":
-        if user_data.get("is_pdf") or method in clean_words or not is_method_trusted:
+        if (user_data.get("is_pdf") and not user_data.get("metodo_confirmado")) or method in clean_words or not is_method_trusted:
             user_data["estado"] = "AGUARDANDO_METODO_PAGAMENTO"
             if tx_type == "RECEITA":
                 keyboard = ReplyKeyboardMarkup([
@@ -572,6 +581,20 @@ async def dispatch_confirmation_triggers(bot, chat_id, user_data):
                         parse_mode="Markdown"
                     )
                 return
+        
+        if user_data.get("is_pdf") and tx_type != "RECEITA" and not user_data.get("parcelamento_confirmado"):
+            user_data["estado"] = "AGUARDANDO_QTD_PARCELAS_PDF"
+            keyboard = ReplyKeyboardMarkup([
+                ["À vista"],
+                ["2x", "3x", "4x", "5x", "6x", "10x", "12x"]
+            ], resize_keyboard=True, one_time_keyboard=True)
+            await bot.send_message(
+                chat_id, 
+                "📄 *Essa compra foi parcelada?*\nSelecione abaixo ou digite a quantidade (ex: `8x`):", 
+                reply_markup=keyboard, 
+                parse_mode="Markdown"
+            )
+            return    
 
         # Step 4: Validate Target Date for long-term debts and recurrences
         parcels = int(tx.get("quantidade_parcelas") or 1)
@@ -1570,7 +1593,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 t["metodo_pagamento"] = choice
                 
             context.user_data["estado"] = None
-            context.user_data["is_pdf"] = False
             context.user_data["metodo_confirmado"] = True
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
@@ -1597,6 +1619,31 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["estado"] = None
             await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
             return
+        
+        # FSM: Adding Transaction -> User defines PDF installments
+        if state == "AGUARDANDO_QTD_PARCELAS_PDF":
+            ans = update.message.text.lower().strip()
+            t = context.user_data["transacao_pendente_json"]["transacoes"][0]
+            
+            if "não" in ans or "nao" in ans or "vista" in ans or ans == "1" or ans == "1x":
+                t["quantidade_parcelas"] = 1
+                t["parcelado"] = False
+            else:
+                # Extrai apenas os números da resposta (ex: de "4x" extrai "4")
+                match = re.search(r'\d+', ans)
+                if match:
+                    qtd = int(match.group(0))
+                    t["quantidade_parcelas"] = max(1, qtd)
+                    t["parcelado"] = True if qtd > 1 else False
+                else:
+                    await update.message.reply_text("❌ Formato inválido. Selecione uma opção ou digite um número (ex: 6x).")
+                    return
+            
+            # Marca como confirmado e devolve para o avaliador seguir o fluxo
+            context.user_data["parcelamento_confirmado"] = True
+            context.user_data["estado"] = None
+            await dispatch_confirmation_triggers(context.bot, chat_id, context.user_data)
+            return    
 
         # FSM: Adding Transaction -> User picks the Credit Card
         if state == "AGUARDANDO_SELECAO_CARTAO":
